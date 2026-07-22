@@ -36,17 +36,38 @@ The documented topology is `auth.example.com` (OAuth callback + admin) plus apps
 
 Startup **fails** if `COOKIE_DOMAIN` is empty, unless you explicitly set `SINGLE_HOST=true` (only when `AUTH_HOST` itself is the sole protected host).
 
+## Container image (GHCR)
+
+CI builds and publishes multi-arch (`linux/amd64`, `linux/arm64`) images to GitHub Container Registry on every push to `main` and on version tags (`v*`).
+
+```bash
+docker pull ghcr.io/yitech/discord-forward-auth:latest
+# or a release tag / commit sha:
+# docker pull ghcr.io/yitech/discord-forward-auth:1.0.0
+# docker pull ghcr.io/yitech/discord-forward-auth:sha-<gitsha>
+```
+
+If the package is private, authenticate first:
+
+```bash
+echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
+```
+
 ## Quick start (Docker Compose)
 
 1. Create a Discord application OAuth2 redirect: `https://<AUTH_HOST>/_oauth`
    - Scopes: `identify`, `guilds.members.read`
 2. Copy `.env.example` → `.env` and fill Discord + guild + bootstrap role IDs.
 3. Set `COOKIE_DOMAIN=.example.com` (matching your real parent domain).
-4. Run:
+4. Run (build locally, or pull from GHCR):
 
 ```bash
 cd deploy
+# Local build:
 docker compose --env-file ../.env up --build
+
+# Or use the published image:
+IMAGE=ghcr.io/yitech/discord-forward-auth:latest docker compose --env-file ../.env up
 ```
 
 Service listens on `:4181`. Admin UI: `https://<AUTH_HOST>/admin/` (behind Traefik TLS).

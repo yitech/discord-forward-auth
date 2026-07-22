@@ -16,6 +16,7 @@ services:
       retries: 10
 
   discord-auth:
+    image: ${IMAGE:-discord-forward-auth:local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
