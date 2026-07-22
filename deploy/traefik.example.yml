@@ -27,12 +27,12 @@ http:
           - discord-auth
 
   routers:
-    # Auth host: OAuth callback + admin UI
+    # Auth host: OAuth callback + public index + admin UI
     auth-host:
       rule: "Host(`auth.example.com`)"
       entryPoints: ["websecure"]
       service: discord-auth
-      # Do not put forwardAuth on /_oauth (callback must be reachable unauthenticated).
+      # Do not put forwardAuth on the auth host (index/login/callback must be public).
       # Protect /admin via the service's own session checks + /api/* admin gate.
       tls: {}
 

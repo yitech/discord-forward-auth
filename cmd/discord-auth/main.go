@@ -23,8 +23,8 @@ import (
 	"github.com/yitech/discord-forward-auth/migrations"
 )
 
-//go:embed all:admin
-var adminEmbed embed.FS
+//go:embed all:web
+var webEmbed embed.FS
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -61,13 +61,13 @@ func main() {
 	auditStore := audit.NewPostgresStore(pool)
 	discordClient := discord.NewClient(cfg.DiscordClientID, cfg.DiscordClientSecret, cfg.RedirectURI())
 
-	adminFS, err := fs.Sub(adminEmbed, "admin")
+	webFS, err := fs.Sub(webEmbed, "web")
 	if err != nil {
-		log.Error("admin embed failed", "err", err)
+		log.Error("web embed failed", "err", err)
 		os.Exit(1)
 	}
 
-	srv := httpapi.New(cfg, sessionStore, mappingStore, hostStore, auditStore, discordClient, adminFS, log)
+	srv := httpapi.New(cfg, sessionStore, mappingStore, hostStore, auditStore, discordClient, webFS, log)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),

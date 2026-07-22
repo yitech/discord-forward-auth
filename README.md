@@ -22,7 +22,8 @@ Browser ──HTTPS──> Traefik ──ForwardAuth──> discord-auth
 ```
 
 - Server-side opaque sessions in Postgres (revocable on logout or admin kick).
-- Role→group mappings and host→group policies edited in the admin UI at `https://<AUTH_HOST>/admin/`.
+- Public index at `https://<AUTH_HOST>/` shows guest welcome or the signed-in identity (logout + optional Admin link).
+- Role→group mappings and host→group policies edited in the admin UI at `https://<AUTH_HOST>/admin/` (admins only).
 - Admin mutations write an append-only audit history (paginated in the UI / `/api/audit`).
 - `BOOTSTRAP_ADMIN_ROLE_ID` always grants the admin group (break-glass / first admin).
 
@@ -52,7 +53,7 @@ Host-policy edits apply on the next ForwardAuth request. Role→group mapping ch
 
 ## Multi-host cookies (required)
 
-The documented topology is `auth.example.com` (OAuth callback + admin) plus apps like `app.example.com`.
+The documented topology is `auth.example.com` (OAuth callback + public index + admin) plus apps like `app.example.com`.
 
 **You must set `COOKIE_DOMAIN` to the shared parent domain** (e.g. `.example.com`). Without it:
 
@@ -100,7 +101,7 @@ docker compose --env-file ../.env up --build
 IMAGE=ghcr.io/yitech/discord-forward-auth:latest docker compose --env-file ../.env up
 ```
 
-Service listens on `:4181`. Admin UI: `https://<AUTH_HOST>/admin/` (behind Traefik TLS).
+Service listens on `:4181`. Index: `https://<AUTH_HOST>/`. Admin UI: `https://<AUTH_HOST>/admin/` (admins only; behind Traefik TLS).
 
 ## Configuration
 
@@ -184,20 +185,21 @@ docker compose -f deploy/docker-compose.yml up postgres -d
 export $(grep -v '^#' .env | xargs)
 go run ./cmd/discord-auth
 
-# Admin UI (proxies /api to :4181)
+# Web UI (proxies /api to :4181) — home at /, admin at /admin/
 cd web && npm install && npm run dev
 ```
 
-Production UI is embedded: `cd web && npm run build` writes into `cmd/discord-auth/admin/`.
+Production UI is embedded: `cd web && npm run build` writes into `cmd/discord-auth/web/`.
 
 ## Auth flow (summary)
 
-1. Unauthenticated **top-level** ForwardAuth (`Sec-Fetch-Mode: navigate` / `Sec-Fetch-Dest: document`, or HTML `Accept`) → `302` to Discord authorize (`state` + CSRF cookie). Sub-resource requests get bare `401` so they cannot clobber the CSRF cookie.
-2. Callback `/_oauth` exchanges code (one transport retry; 15s client timeout), loads guild member roles, maps to groups.
-3. Empty groups or non-member → `403`. Discord/DB errors → fail-closed. A missing CSRF cookie (consumed/expired login) returns a distinct message from state mismatch.
-4. Session cookie set; Discord access token discarded.
-5. Redirect back to the original app host/path (host must be under `COOKIE_DOMAIN` or equal `AUTH_HOST`).
-6. Authenticated → host ACL check on `X-Forwarded-Host` → `200` + `X-Auth-*` headers, or `403` if the host has no policy / user lacks a required group (admins bypass).
+1. Direct browse of `https://<AUTH_HOST>/` serves the public index (guest or signed-in identity). Login is explicit via `/?rd=/` (or `/?rd=/admin/` from the admin page).
+2. Unauthenticated **top-level** ForwardAuth (`X-Forwarded-Uri` from Traefik; `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Dest: document`, or HTML `Accept`) → `302` to Discord authorize (`state` + CSRF cookie). Sub-resource requests get bare `401` so they cannot clobber the CSRF cookie.
+3. Callback `/_oauth` exchanges code (one transport retry; 15s client timeout), loads guild member roles, maps to groups.
+4. Empty groups or non-member → `403`. Discord/DB errors → fail-closed. A missing CSRF cookie (consumed/expired login) returns a distinct message from state mismatch.
+5. Session cookie set; Discord access token discarded.
+6. Redirect back to the original app host/path, or to `/` on the auth host when no app return target was set (host must be under `COOKIE_DOMAIN` or equal `AUTH_HOST`). Not every login lands on `/admin/`.
+7. Authenticated ForwardAuth → host ACL check on `X-Forwarded-Host` → `200` + `X-Auth-*` headers, or `403` if the host has no policy / user lacks a required group (admins bypass).
 
 ## License
 
