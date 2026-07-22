@@ -18,7 +18,7 @@ on:
       dry_run:
         description: "Log what would be deleted without deleting it"
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
