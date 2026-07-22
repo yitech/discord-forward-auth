@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: discord_auth
+      POSTGRES_PASSWORD: discord_auth
+      POSTGRES_DB: discord_auth
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U discord_auth -d discord_auth"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  discord-auth:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4181:4181"
+    environment:
+      LISTEN_ADDR: ":4181"
+      AUTH_HOST: ${AUTH_HOST:-auth.localhost}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:?set DISCORD_CLIENT_ID}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:?set DISCORD_CLIENT_SECRET}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:?set DISCORD_GUILD_ID}
+      BOOTSTRAP_ADMIN_ROLE_ID: ${BOOTSTRAP_ADMIN_ROLE_ID:?set BOOTSTRAP_ADMIN_ROLE_ID}
+      DATABASE_URL: postgres://discord_auth:discord_auth@postgres:5432/discord_auth?sslmode=disable
+      SESSION_TTL: ${SESSION_TTL:-1800}
+      MAPPING_CACHE_TTL: ${MAPPING_CACHE_TTL:-30}
+      ADMIN_GROUP: ${ADMIN_GROUP:-admin}
+      # For shared auth-host cookies across subdomains, set e.g. .example.com
+      # and use COOKIE_NAME without __Host- prefix (auto-adjusted by the app).
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
+      HEADER_USER: ${HEADER_USER:-X-Auth-User}
+      HEADER_GROUPS: ${HEADER_GROUPS:-X-Auth-Groups}
+
+volumes:
+  pgdata:

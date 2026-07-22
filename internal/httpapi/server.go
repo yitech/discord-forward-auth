@@ -1,0 +1,378 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/yitech/discord-forward-auth/internal/authz"
+	"github.com/yitech/discord-forward-auth/internal/config"
+	"github.com/yitech/discord-forward-auth/internal/discord"
+	"github.com/yitech/discord-forward-auth/internal/mapping"
+	"github.com/yitech/discord-forward-auth/internal/session"
+)
+
+type Server struct {
+	cfg      *config.Config
+	sessions session.Store
+	mappings mapping.Store
+	discord  discord.API
+	authz    *authz.Resolver
+	adminFS  fs.FS
+	log      *slog.Logger
+	now      func() time.Time
+}
+
+func New(
+	cfg *config.Config,
+	sessions session.Store,
+	mappings mapping.Store,
+	discordAPI discord.API,
+	adminFS fs.FS,
+	log *slog.Logger,
+) *Server {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Server{
+		cfg:      cfg,
+		sessions: sessions,
+		mappings: mappings,
+		discord:  discordAPI,
+		authz: &authz.Resolver{
+			Mappings:           mappings,
+			GuildID:            cfg.DiscordGuildID,
+			BootstrapAdminRole: cfg.BootstrapAdminRole,
+			AdminGroup:         cfg.AdminGroup,
+		},
+		adminFS: adminFS,
+		log:     log,
+		now:     time.Now,
+	}
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /_oauth", s.handleOAuthCallback)
+	mux.HandleFunc("GET /_oauth/logout", s.handleLogout)
+	mux.HandleFunc("GET /api/me", s.handleMe)
+	mux.HandleFunc("GET /api/mappings", s.requireAdmin(s.handleListMappings))
+	mux.HandleFunc("POST /api/mappings", s.requireAdmin(s.handleUpsertMapping))
+	mux.HandleFunc("DELETE /api/mappings", s.requireAdmin(s.handleDeleteMapping))
+
+	if s.adminFS != nil {
+		mux.Handle("GET /admin/", s.adminHandler())
+		mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/admin/", http.StatusFound)
+		})
+	}
+
+	mux.HandleFunc("/", s.handleForwardAuth)
+	return mux
+}
+
+func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/healthz" {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+		return
+	}
+
+	id := s.sessionIDFromRequest(r)
+	if id == "" {
+		s.redirectToLogin(w, r)
+		return
+	}
+
+	sess, err := s.sessions.GetValid(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, session.ErrNotFound) {
+			s.clearSessionCookie(w)
+			s.redirectToLogin(w, r)
+			return
+		}
+		s.log.Error("session lookup failed", "err", err)
+		http.Error(w, "auth unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	if len(sess.Groups) == 0 {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Best-effort last_seen update; ignore errors.
+	_ = s.sessions.Touch(r.Context(), sess.ID)
+
+	w.Header().Set(s.cfg.HeaderUser, sess.DiscordUser)
+	w.Header().Set(s.cfg.HeaderGroups, strings.Join(sess.Groups, ","))
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) redirectToLogin(w http.ResponseWriter, r *http.Request) {
+	returnPath := originalReturnPath(r)
+	state, err := encodeState(returnPath)
+	if err != nil {
+		s.log.Error("encode state failed", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	s.setCSRFCookie(w, state)
+
+	q := url.Values{}
+	q.Set("response_type", "code")
+	q.Set("client_id", s.cfg.DiscordClientID)
+	q.Set("redirect_uri", s.cfg.RedirectURI())
+	q.Set("scope", "identify guilds.members.read")
+	q.Set("state", state)
+	q.Set("prompt", "none")
+
+	http.Redirect(w, r, s.cfg.AuthorizeURL()+"?"+q.Encode(), http.StatusFound)
+}
+
+func originalReturnPath(r *http.Request) string {
+	// Explicit return target (admin UI login).
+	if rd := r.URL.Query().Get("rd"); rd != "" {
+		return SafeReturnPath(rd)
+	}
+	// Traefik ForwardAuth provides original URI via X-Forwarded-Uri.
+	if uri := r.Header.Get("X-Forwarded-Uri"); uri != "" {
+		return SafeReturnPath(uri)
+	}
+	if r.URL.Path != "" && r.URL.Path != "/" {
+		return SafeReturnPath(r.URL.RequestURI())
+	}
+	return "/"
+}
+
+func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if errParam := q.Get("error"); errParam != "" {
+		http.Error(w, "oauth error: "+errParam, http.StatusForbidden)
+		return
+	}
+
+	state := q.Get("state")
+	code := q.Get("code")
+	if state == "" || code == "" {
+		http.Error(w, "missing code or state", http.StatusBadRequest)
+		return
+	}
+
+	csrf, err := r.Cookie(s.cfg.CSRFCookieName)
+	if err != nil || csrf.Value == "" || csrf.Value != state {
+		http.Error(w, "invalid state", http.StatusForbidden)
+		return
+	}
+	s.clearCSRFCookie(w)
+
+	st, err := decodeState(state)
+	if err != nil {
+		http.Error(w, "invalid state", http.StatusForbidden)
+		return
+	}
+
+	ctx := r.Context()
+	tok, err := s.discord.ExchangeCode(ctx, code)
+	if err != nil {
+		s.log.Error("token exchange failed", "err", err)
+		http.Error(w, "authentication failed", http.StatusForbidden)
+		return
+	}
+
+	user, err := s.discord.GetMe(ctx, tok.AccessToken)
+	if err != nil {
+		s.log.Error("get me failed", "err", err)
+		http.Error(w, "authentication failed", http.StatusForbidden)
+		return
+	}
+
+	member, err := s.discord.GetGuildMember(ctx, tok.AccessToken, s.cfg.DiscordGuildID)
+	// Access token intentionally discarded after this point.
+	tok = nil
+	if errors.Is(err, discord.ErrNotGuildMember) {
+		http.Error(w, "not a guild member", http.StatusForbidden)
+		return
+	}
+	if err != nil {
+		s.log.Error("guild member lookup failed", "err", err)
+		http.Error(w, "authentication failed", http.StatusForbidden)
+		return
+	}
+
+	groups, err := s.authz.GroupsForRoles(ctx, member.Roles)
+	if err != nil {
+		s.log.Error("role mapping failed", "err", err)
+		http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if len(groups) == 0 {
+		http.Error(w, "no authorized groups", http.StatusForbidden)
+		return
+	}
+
+	sess, err := s.sessions.Create(ctx, user.ID, groups, s.cfg.SessionTTL)
+	if err != nil {
+		s.log.Error("create session failed", "err", err)
+		http.Error(w, "authentication failed", http.StatusServiceUnavailable)
+		return
+	}
+
+	s.setSessionCookie(w, sess.ID, sess.ExpiresAt)
+	http.Redirect(w, r, st.Return, http.StatusFound)
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if id := s.sessionIDFromRequest(r); id != "" {
+		_ = s.sessions.Revoke(r.Context(), id)
+	}
+	s.clearSessionCookie(w)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("logged out"))
+}
+
+func (s *Server) currentSession(ctx context.Context, r *http.Request) (*session.Session, error) {
+	id := s.sessionIDFromRequest(r)
+	if id == "" {
+		return nil, session.ErrNotFound
+	}
+	return s.sessions.GetValid(ctx, id)
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	sess, err := s.currentSession(r.Context(), r)
+	if err != nil {
+		if errors.Is(err, session.ErrNotFound) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		http.Error(w, "auth unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"discord_user": sess.DiscordUser,
+		"groups":       sess.Groups,
+		"admin":        authz.HasGroup(sess.Groups, s.cfg.AdminGroup),
+		"guild_id":     s.cfg.DiscordGuildID,
+		"admin_group":  s.cfg.AdminGroup,
+	})
+}
+
+func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sess, err := s.currentSession(r.Context(), r)
+		if err != nil {
+			if errors.Is(err, session.ErrNotFound) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			http.Error(w, "auth unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if !authz.HasGroup(sess.Groups, s.cfg.AdminGroup) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		ctx := context.WithValue(r.Context(), sessionKey{}, sess)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+type sessionKey struct{}
+
+func sessionFromCtx(ctx context.Context) *session.Session {
+	s, _ := ctx.Value(sessionKey{}).(*session.Session)
+	return s
+}
+
+type mappingRequest struct {
+	RoleID    string `json:"role_id"`
+	GroupName string `json:"group_name"`
+}
+
+func (s *Server) handleListMappings(w http.ResponseWriter, r *http.Request) {
+	list, err := s.mappings.List(r.Context(), s.cfg.DiscordGuildID)
+	if err != nil {
+		s.log.Error("list mappings failed", "err", err)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if list == nil {
+		list = []mapping.Mapping{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleUpsertMapping(w http.ResponseWriter, r *http.Request) {
+	var req mappingRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.RoleID = strings.TrimSpace(req.RoleID)
+	req.GroupName = strings.TrimSpace(req.GroupName)
+	if req.RoleID == "" || req.GroupName == "" {
+		http.Error(w, "role_id and group_name required", http.StatusBadRequest)
+		return
+	}
+
+	sess := sessionFromCtx(r.Context())
+	updatedBy := ""
+	if sess != nil {
+		updatedBy = sess.DiscordUser
+	}
+	if err := s.mappings.Upsert(r.Context(), s.cfg.DiscordGuildID, req.RoleID, req.GroupName, updatedBy); err != nil {
+		s.log.Error("upsert mapping failed", "err", err)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
+	roleID := strings.TrimSpace(r.URL.Query().Get("role_id"))
+	groupName := strings.TrimSpace(r.URL.Query().Get("group_name"))
+	if roleID == "" || groupName == "" {
+		http.Error(w, "role_id and group_name required", http.StatusBadRequest)
+		return
+	}
+	if err := s.mappings.Delete(r.Context(), s.cfg.DiscordGuildID, roleID, groupName); err != nil {
+		s.log.Error("delete mapping failed", "err", err)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) adminHandler() http.Handler {
+	fileServer := http.FileServer(http.FS(s.adminFS))
+	return http.StripPrefix("/admin/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path == "" {
+			path = "index.html"
+		}
+		if _, err := fs.Stat(s.adminFS, path); err != nil {
+			http.ServeFileFS(w, r, s.adminFS, "index.html")
+			return
+		}
+		fileServer.ServeHTTP(w, r)
+	}))
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	return dec.Decode(dest)
+}

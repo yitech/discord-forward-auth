@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+web/node_modules
+**/*_test.go
+**/coverage.out
+.DS_Store
+*.md
+!README.md

@@ -1,0 +1,52 @@
+# Example Traefik dynamic config for discord-forward-auth.
+# Register Discord OAuth redirect URI: https://auth.example.com/_oauth
+
+http:
+  middlewares:
+    # CRITICAL: strip client-supplied auth headers before ForwardAuth runs.
+    strip-auth-headers:
+      headers:
+        customRequestHeaders:
+          X-Auth-User: ""
+          X-Auth-Groups: ""
+
+    discord-auth:
+      forwardAuth:
+        address: http://discord-auth:4181
+        authResponseHeaders:
+          - X-Auth-User
+          - X-Auth-Groups
+
+    discord-auth-chain:
+      chain:
+        middlewares:
+          - strip-auth-headers
+          - discord-auth
+
+  routers:
+    # Auth host: OAuth callback + admin UI
+    auth-host:
+      rule: "Host(`auth.example.com`)"
+      entryPoints: ["websecure"]
+      service: discord-auth
+      # Do not put forwardAuth on /_oauth (callback must be reachable unauthenticated).
+      # Protect /admin via the service's own session checks + /api/* admin gate.
+      tls: {}
+
+    # Example protected app
+    my-app:
+      rule: "Host(`app.example.com`)"
+      entryPoints: ["websecure"]
+      middlewares: ["discord-auth-chain"]
+      service: my-app
+      tls: {}
+
+  services:
+    discord-auth:
+      loadBalancer:
+        servers:
+          - url: "http://discord-auth:4181"
+    my-app:
+      loadBalancer:
+        servers:
+          - url: "http://my-app:8080"
