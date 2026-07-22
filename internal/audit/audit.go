@@ -12,6 +12,9 @@ const (
 	ActionHostPolicyUpsert  = "host_policy.upsert"
 	ActionHostPolicyDelete  = "host_policy.delete"
 	ActionSessionRevokeUser = "session.revoke_user"
+	ActionLoginSuccess      = "login.success"
+	ActionLoginDenied       = "login.denied"
+	ActionLogout            = "session.logout"
 )
 
 type Event struct {
