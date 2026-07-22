@@ -301,33 +301,37 @@
     <div class="center muted">Loading…</div>
   {:else if !isAdminRoute}
     {#if !me}
-      <div class="center panel home-panel">
-        <h1>Discord Forward Auth</h1>
-        <p class="lede">Welcome, guest.</p>
-        <p class="muted">Sign in with Discord to access protected apps on this domain.</p>
-        <div class="actions">
-          <button type="button" onclick={() => signIn('/')}>Sign in with Discord</button>
+      <div class="center">
+        <div class="panel home-panel">
+          <h1>Discord Forward Auth</h1>
+          <p class="lede">Welcome, guest.</p>
+          <p class="muted">Sign in with Discord to access protected apps on this domain.</p>
+          <div class="actions">
+            <button type="button" onclick={() => signIn('/')}>Sign in with Discord</button>
+          </div>
         </div>
       </div>
     {:else}
-      <div class="center panel home-panel">
-        <h1>Discord Forward Auth</h1>
-        <p class="lede">You are signed in.</p>
-        <dl class="identity">
-          <div>
-            <dt>Discord user</dt>
-            <dd class="mono">{me.discord_user}</dd>
+      <div class="center">
+        <div class="panel home-panel">
+          <h1>Discord Forward Auth</h1>
+          <p class="lede">You are signed in.</p>
+          <dl class="identity">
+            <div>
+              <dt>Discord user</dt>
+              <dd class="mono">{me.discord_user}</dd>
+            </div>
+            <div>
+              <dt>Groups</dt>
+              <dd class="mono">{groupsLabel()}</dd>
+            </div>
+          </dl>
+          <div class="actions">
+            {#if me.admin}
+              <a class="button" href="/admin/">Admin</a>
+            {/if}
+            <button type="button" class="secondary" onclick={signOut}>Sign out</button>
           </div>
-          <div>
-            <dt>Groups</dt>
-            <dd class="mono">{groupsLabel()}</dd>
-          </div>
-        </dl>
-        <div class="actions">
-          {#if me.admin}
-            <a class="button" href="/admin/">Admin</a>
-          {/if}
-          <button type="button" class="secondary" onclick={signOut}>Sign out</button>
         </div>
       </div>
     {/if}
