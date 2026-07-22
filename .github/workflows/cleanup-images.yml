@@ -1,0 +1,46 @@
+name: Cleanup images
+
+# Prune old GHCR images on a schedule, keeping the 10 most recent.
+#
+# Images here are multi-arch manifest lists: each build publishes one tagged
+# index (sha-<sha>, plus latest/main on the default branch) whose per-platform
+# children and attestation blobs appear as *untagged* versions. A plain
+# "delete untagged" or "keep N versions" policy would strip those children and
+# break `docker pull` for the images it meant to keep, so this uses an action
+# that resolves each index to its children before deleting.
+
+on:
+  schedule:
+    # Mondays at 03:00 UTC.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Log what would be deleted without deleting it"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete old image versions
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          packages: ${{ github.event.repository.name }}
+          owner: ${{ github.repository_owner }}
+          # Keep the 10 newest tagged images; their platform children and
+          # attestations are retained with them.
+          keep-n-tagged: 10
+          # Never prune the floating tags, whatever their age.
+          exclude-tags: latest,main
+          # Sweep untagged versions left dangling by overwritten tags.
+          delete-untagged: true
+          # Post-run check that every surviving index still has its children.
+          validate: true
+          dry-run: ${{ inputs.dry_run || false }}
