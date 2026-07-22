@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/yitech/discord-forward-auth/internal/audit"
 	"github.com/yitech/discord-forward-auth/internal/config"
 	"github.com/yitech/discord-forward-auth/internal/discord"
 	"github.com/yitech/discord-forward-auth/internal/httpapi"
@@ -55,6 +56,7 @@ func main() {
 
 	sessionStore := session.NewPostgresStore(pool)
 	mappingStore := mapping.NewCachedStore(mapping.NewPostgresStore(pool), cfg.MappingCacheTTL)
+	auditStore := audit.NewPostgresStore(pool)
 	discordClient := discord.NewClient(cfg.DiscordClientID, cfg.DiscordClientSecret, cfg.RedirectURI())
 
 	adminFS, err := fs.Sub(adminEmbed, "admin")
@@ -63,7 +65,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := httpapi.New(cfg, sessionStore, mappingStore, discordClient, adminFS, log)
+	srv := httpapi.New(cfg, sessionStore, mappingStore, auditStore, discordClient, adminFS, log)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),

@@ -23,6 +23,7 @@ Browser ──HTTPS──> Traefik ──ForwardAuth──> discord-auth
 
 - Server-side opaque sessions in Postgres (revocable on logout or admin kick).
 - Role→group mappings edited in the admin UI at `https://<AUTH_HOST>/admin/`.
+- Admin mutations write an append-only audit history (paginated in the UI / `/api/audit`).
 - `BOOTSTRAP_ADMIN_ROLE_ID` always grants the admin group (break-glass / first admin).
 
 ## Multi-host cookies (required)
@@ -127,8 +128,20 @@ middlewares:
 | `GET` | `/api/me` | Current session |
 | `GET/POST/DELETE` | `/api/mappings` | Role→group CRUD (admin) |
 | `POST` | `/api/sessions/revoke` | Body `{"discord_user":"<id>"}` — revoke all sessions for a user (admin) |
+| `GET` | `/api/audit` | Paginated audit history (admin). Query: `limit` (default 25, max 100), `offset` (default 0) |
 
 State-changing admin routes also require same-origin (`Origin` / `Sec-Fetch-Site`).
+
+Audit events are recorded for mapping upsert/delete and session revoke. Response shape:
+
+```json
+{
+  "items": [{"id": 1, "at": "...", "actor": "...", "action": "mapping.upsert", "target": "...", "details": {}}],
+  "total": 42,
+  "limit": 25,
+  "offset": 0
+}
+```
 
 ## Local development
 

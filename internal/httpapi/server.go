@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yitech/discord-forward-auth/internal/audit"
 	"github.com/yitech/discord-forward-auth/internal/authz"
 	"github.com/yitech/discord-forward-auth/internal/config"
 	"github.com/yitech/discord-forward-auth/internal/discord"
@@ -19,10 +21,16 @@ import (
 	"github.com/yitech/discord-forward-auth/internal/session"
 )
 
+const (
+	auditDefaultLimit = 25
+	auditMaxLimit     = 100
+)
+
 type Server struct {
 	cfg      *config.Config
 	sessions session.Store
 	mappings mapping.Store
+	audit    audit.Store
 	discord  discord.API
 	authz    *authz.Resolver
 	adminFS  fs.FS
@@ -34,6 +42,7 @@ func New(
 	cfg *config.Config,
 	sessions session.Store,
 	mappings mapping.Store,
+	auditStore audit.Store,
 	discordAPI discord.API,
 	adminFS fs.FS,
 	log *slog.Logger,
@@ -45,6 +54,7 @@ func New(
 		cfg:      cfg,
 		sessions: sessions,
 		mappings: mappings,
+		audit:    auditStore,
 		discord:  discordAPI,
 		authz: &authz.Resolver{
 			Mappings:           mappings,
@@ -67,6 +77,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mappings", s.requireAdmin(s.requireSameOrigin(s.handleUpsertMapping)))
 	mux.HandleFunc("DELETE /api/mappings", s.requireAdmin(s.requireSameOrigin(s.handleDeleteMapping)))
 	mux.HandleFunc("POST /api/sessions/revoke", s.requireAdmin(s.requireSameOrigin(s.handleRevokeSessions)))
+	mux.HandleFunc("GET /api/audit", s.requireAdmin(s.handleListAudit))
 
 	if s.adminFS != nil {
 		mux.Handle("GET /admin/", s.adminHandler())
@@ -408,6 +419,11 @@ func (s *Server) handleUpsertMapping(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	s.recordAudit(r.Context(), updatedBy, audit.ActionMappingUpsert, req.RoleID, map[string]any{
+		"guild_id":   s.cfg.DiscordGuildID,
+		"role_id":    req.RoleID,
+		"group_name": req.GroupName,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -423,6 +439,15 @@ func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	actor := ""
+	if sess := sessionFromCtx(r.Context()); sess != nil {
+		actor = sess.DiscordUser
+	}
+	s.recordAudit(r.Context(), actor, audit.ActionMappingDelete, roleID, map[string]any{
+		"guild_id":   s.cfg.DiscordGuildID,
+		"role_id":    roleID,
+		"group_name": groupName,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -447,8 +472,64 @@ func (s *Server) handleRevokeSessions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	s.recordAudit(r.Context(), actor, audit.ActionSessionRevokeUser, req.DiscordUser, map[string]any{
+		"discord_user": req.DiscordUser,
+	})
 	s.log.Info("revoked user sessions", "target", req.DiscordUser, "by", actor)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
+	limit, offset := parsePagination(r, auditDefaultLimit, auditMaxLimit)
+	items, total, err := s.audit.List(r.Context(), limit, offset)
+	if err != nil {
+		s.log.Error("list audit failed", "err", err)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if items == nil {
+		items = []audit.Event{}
+	}
+	writeJSON(w, http.StatusOK, audit.Page{
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
+	})
+}
+
+func (s *Server) recordAudit(ctx context.Context, actor, action, target string, details map[string]any) {
+	if s.audit == nil {
+		return
+	}
+	if err := s.audit.Append(ctx, actor, action, target, details); err != nil {
+		s.log.Error("audit append failed", "err", err, "action", action, "actor", actor, "target", target)
+	}
+}
+
+func parsePagination(r *http.Request, defaultLimit, maxLimit int) (limit, offset int) {
+	limit = defaultLimit
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+
+	if v := strings.TrimSpace(r.URL.Query().Get("offset")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			offset = n
+		}
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
 }
 
 func (s *Server) adminHandler() http.Handler {
