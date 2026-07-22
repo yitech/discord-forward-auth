@@ -53,10 +53,15 @@ If the package is private, authenticate first:
 echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
 ```
 
+## Discord setup
+
+Before Compose/Traefik, configure the Discord application, guild, and bootstrap role.
+
+See **[docs/discord-setup.md](docs/discord-setup.md)** for the full walkthrough, common traps (no bot required, managed bot roles, guild-owner empty roles), and an error→cause troubleshooting table.
+
 ## Quick start (Docker Compose)
 
-1. Create a Discord application OAuth2 redirect: `https://<AUTH_HOST>/_oauth`
-   - Scopes: `identify`, `guilds.members.read`
+1. Complete [Discord setup](docs/discord-setup.md) (redirect `https://<AUTH_HOST>/_oauth`, guild ID, self-assigned bootstrap role).
 2. Copy `.env.example` → `.env` and fill Discord + guild + bootstrap role IDs.
 3. Set `COOKIE_DOMAIN=.example.com` (matching your real parent domain).
 4. Run (build locally, or pull from GHCR):
@@ -80,7 +85,7 @@ Service listens on `:4181`. Admin UI: `https://<AUTH_HOST>/admin/` (behind Traef
 | `DISCORD_CLIENT_ID` | required | Discord OAuth client ID |
 | `DISCORD_CLIENT_SECRET` | required | Discord OAuth client secret |
 | `DISCORD_GUILD_ID` | required | Allowed Discord guild |
-| `BOOTSTRAP_ADMIN_ROLE_ID` | required | Discord role that always maps to admin |
+| `BOOTSTRAP_ADMIN_ROLE_ID` | required | Normal (non-managed) Discord role that always maps to admin; must be assigned to the user |
 | `DATABASE_URL` | required | Postgres connection string |
 | `COOKIE_DOMAIN` | required\* | Shared parent domain (e.g. `.example.com`) for multi-host |
 | `SINGLE_HOST` | `false` | Opt into host-only cookies when only `AUTH_HOST` is protected |
