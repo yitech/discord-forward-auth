@@ -9,6 +9,8 @@ import (
 const (
 	ActionMappingUpsert     = "mapping.upsert"
 	ActionMappingDelete     = "mapping.delete"
+	ActionHostPolicyUpsert  = "host_policy.upsert"
+	ActionHostPolicyDelete  = "host_policy.delete"
 	ActionSessionRevokeUser = "session.revoke_user"
 )
 

@@ -16,6 +16,7 @@ import (
 	"github.com/yitech/discord-forward-auth/internal/audit"
 	"github.com/yitech/discord-forward-auth/internal/config"
 	"github.com/yitech/discord-forward-auth/internal/discord"
+	"github.com/yitech/discord-forward-auth/internal/hostpolicy"
 	"github.com/yitech/discord-forward-auth/internal/httpapi"
 	"github.com/yitech/discord-forward-auth/internal/mapping"
 	"github.com/yitech/discord-forward-auth/internal/session"
@@ -56,6 +57,7 @@ func main() {
 
 	sessionStore := session.NewPostgresStore(pool)
 	mappingStore := mapping.NewCachedStore(mapping.NewPostgresStore(pool), cfg.MappingCacheTTL)
+	hostStore := hostpolicy.NewPostgresStore(pool)
 	auditStore := audit.NewPostgresStore(pool)
 	discordClient := discord.NewClient(cfg.DiscordClientID, cfg.DiscordClientSecret, cfg.RedirectURI())
 
@@ -65,7 +67,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := httpapi.New(cfg, sessionStore, mappingStore, auditStore, discordClient, adminFS, log)
+	srv := httpapi.New(cfg, sessionStore, mappingStore, hostStore, auditStore, discordClient, adminFS, log)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),

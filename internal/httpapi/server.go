@@ -17,6 +17,7 @@ import (
 	"github.com/yitech/discord-forward-auth/internal/authz"
 	"github.com/yitech/discord-forward-auth/internal/config"
 	"github.com/yitech/discord-forward-auth/internal/discord"
+	"github.com/yitech/discord-forward-auth/internal/hostpolicy"
 	"github.com/yitech/discord-forward-auth/internal/mapping"
 	"github.com/yitech/discord-forward-auth/internal/session"
 )
@@ -30,6 +31,7 @@ type Server struct {
 	cfg      *config.Config
 	sessions session.Store
 	mappings mapping.Store
+	hosts    hostpolicy.Store
 	audit    audit.Store
 	discord  discord.API
 	authz    *authz.Resolver
@@ -42,6 +44,7 @@ func New(
 	cfg *config.Config,
 	sessions session.Store,
 	mappings mapping.Store,
+	hosts hostpolicy.Store,
 	auditStore audit.Store,
 	discordAPI discord.API,
 	adminFS fs.FS,
@@ -50,10 +53,14 @@ func New(
 	if log == nil {
 		log = slog.Default()
 	}
+	if hosts == nil {
+		hosts = hostpolicy.NewMemoryStore()
+	}
 	return &Server{
 		cfg:      cfg,
 		sessions: sessions,
 		mappings: mappings,
+		hosts:    hosts,
 		audit:    auditStore,
 		discord:  discordAPI,
 		authz: &authz.Resolver{
@@ -76,6 +83,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mappings", s.requireAdmin(s.handleListMappings))
 	mux.HandleFunc("POST /api/mappings", s.requireAdmin(s.requireSameOrigin(s.handleUpsertMapping)))
 	mux.HandleFunc("DELETE /api/mappings", s.requireAdmin(s.requireSameOrigin(s.handleDeleteMapping)))
+	mux.HandleFunc("GET /api/host-policies", s.requireAdmin(s.handleListHostPolicies))
+	mux.HandleFunc("POST /api/host-policies", s.requireAdmin(s.requireSameOrigin(s.handleUpsertHostPolicy)))
+	mux.HandleFunc("DELETE /api/host-policies", s.requireAdmin(s.requireSameOrigin(s.handleDeleteHostPolicy)))
 	mux.HandleFunc("POST /api/sessions/revoke", s.requireAdmin(s.requireSameOrigin(s.handleRevokeSessions)))
 	mux.HandleFunc("GET /api/audit", s.requireAdmin(s.handleListAudit))
 
@@ -120,12 +130,41 @@ func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	host := config.NormalizeHost(r.Header.Get("X-Forwarded-Host"))
+	if !s.hostAccessAllowed(r.Context(), w, host, sess.Groups) {
+		return
+	}
+
 	// Best-effort last_seen update; ignore errors.
 	_ = s.sessions.Touch(r.Context(), sess.ID)
 
 	w.Header().Set(s.cfg.HeaderUser, sess.DiscordUser)
 	w.Header().Set(s.cfg.HeaderGroups, strings.Join(sess.Groups, ","))
 	w.WriteHeader(http.StatusOK)
+}
+
+// hostAccessAllowed enforces host → required groups. Writes an error response
+// and returns false when access is denied or the policy store is unavailable.
+func (s *Server) hostAccessAllowed(ctx context.Context, w http.ResponseWriter, host string, groups []string) bool {
+	if authz.HasGroup(groups, s.cfg.AdminGroup) {
+		return true
+	}
+	if host == "" || host == config.NormalizeHost(s.cfg.AuthHost) {
+		return true
+	}
+
+	policy, err := s.hosts.Get(ctx, host)
+	if err != nil && !errors.Is(err, hostpolicy.ErrNotFound) {
+		s.log.Error("host policy lookup failed", "err", err, "host", host)
+		http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+	hasPolicy := err == nil
+	if !hostpolicy.Allowed(host, s.cfg.AuthHost, s.cfg.AdminGroup, groups, policy, hasPolicy) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 // unauthenticated starts OAuth only for top-level navigations. Sub-resource
@@ -379,6 +418,11 @@ type mappingRequest struct {
 	GroupName string `json:"group_name"`
 }
 
+type hostPolicyRequest struct {
+	Host           string   `json:"host"`
+	RequiredGroups []string `json:"required_groups"`
+}
+
 type revokeRequest struct {
 	DiscordUser string `json:"discord_user"`
 }
@@ -447,6 +491,82 @@ func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
 		"guild_id":   s.cfg.DiscordGuildID,
 		"role_id":    roleID,
 		"group_name": groupName,
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleListHostPolicies(w http.ResponseWriter, r *http.Request) {
+	list, err := s.hosts.List(r.Context())
+	if err != nil {
+		s.log.Error("list host policies failed", "err", err)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if list == nil {
+		list = []hostpolicy.Policy{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleUpsertHostPolicy(w http.ResponseWriter, r *http.Request) {
+	var req hostPolicyRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	host := config.NormalizeHost(req.Host)
+	groups := hostpolicy.NormalizeGroups(req.RequiredGroups)
+	if host == "" || len(groups) == 0 {
+		http.Error(w, "host and required_groups required", http.StatusBadRequest)
+		return
+	}
+	if host == config.NormalizeHost(s.cfg.AuthHost) {
+		http.Error(w, "cannot set policy on AUTH_HOST", http.StatusBadRequest)
+		return
+	}
+	if !s.cfg.HostAllowed(host) {
+		http.Error(w, "host not under COOKIE_DOMAIN", http.StatusBadRequest)
+		return
+	}
+
+	sess := sessionFromCtx(r.Context())
+	updatedBy := ""
+	if sess != nil {
+		updatedBy = sess.DiscordUser
+	}
+	if err := s.hosts.Upsert(r.Context(), host, groups, updatedBy); err != nil {
+		s.log.Error("upsert host policy failed", "err", err)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	s.recordAudit(r.Context(), updatedBy, audit.ActionHostPolicyUpsert, host, map[string]any{
+		"host":            host,
+		"required_groups": groups,
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleDeleteHostPolicy(w http.ResponseWriter, r *http.Request) {
+	host := config.NormalizeHost(r.URL.Query().Get("host"))
+	if host == "" {
+		http.Error(w, "host required", http.StatusBadRequest)
+		return
+	}
+	if err := s.hosts.Delete(r.Context(), host); err != nil {
+		if errors.Is(err, hostpolicy.ErrNotFound) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		s.log.Error("delete host policy failed", "err", err)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	actor := ""
+	if sess := sessionFromCtx(r.Context()); sess != nil {
+		actor = sess.DiscordUser
+	}
+	s.recordAudit(r.Context(), actor, audit.ActionHostPolicyDelete, host, map[string]any{
+		"host": host,
 	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

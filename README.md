@@ -1,13 +1,13 @@
 # discord-forward-auth
 
-Independent, reusable [Traefik ForwardAuth](https://doc.traefik.io/traefik/middlewares/http/forwardauth/) service. Any Traefik-protected app can require Discord login with guild membership and role→group authorization—without changing the app itself.
+Independent, reusable [Traefik ForwardAuth](https://doc.traefik.io/traefik/middlewares/http/forwardauth/) service. Any Traefik-protected app can require Discord login with guild membership, role→group mapping, and per-hostname group ACLs—without changing the app itself.
 
 Downstream apps receive identity via headers:
 
 | Header | Value |
 |---|---|
 | `X-Auth-User` | Discord user snowflake |
-| `X-Auth-Groups` | Comma-separated groups (e.g. `admin,operator`) |
+| `X-Auth-Groups` | Comma-separated groups (e.g. `admin,engineer`) |
 
 Header names are configurable (`HEADER_USER`, `HEADER_GROUPS`).
 
@@ -16,15 +16,39 @@ Header names are configurable (`HEADER_USER`, `HEADER_GROUPS`).
 ```
 Browser ──HTTPS──> Traefik ──ForwardAuth──> discord-auth
                      │                            ├─> Discord OAuth2 / API
-                     │  200 + X-Auth-* headers    └─> Postgres (sessions + mappings)
+                     │  200 + X-Auth-* headers    └─> Postgres (sessions + mappings + host policies)
                      ▼
                  Protected app
 ```
 
 - Server-side opaque sessions in Postgres (revocable on logout or admin kick).
-- Role→group mappings edited in the admin UI at `https://<AUTH_HOST>/admin/`.
+- Role→group mappings and host→group policies edited in the admin UI at `https://<AUTH_HOST>/admin/`.
 - Admin mutations write an append-only audit history (paginated in the UI / `/api/audit`).
 - `BOOTSTRAP_ADMIN_ROLE_ID` always grants the admin group (break-glass / first admin).
+
+## Host → group ACL
+
+After login, ForwardAuth checks `X-Forwarded-Host` against admin-configured host policies:
+
+1. **Discord role → group** (existing): e.g. Discord “Engineer” → `engineer`, “BD” → `bd`
+2. **Hostname → required group(s)** (new): e.g. `grafana.example.com` → `engineer`, `metabase.example.com` → `bd`
+
+Rules:
+
+- User needs **any one** of the host’s required groups.
+- Hosts with **no policy** are **denied** (fail-closed) so a new Traefik app is not open to every logged-in guild member.
+- Empty/`AUTH_HOST` skips host ACL (direct auth-host traffic).
+- The `admin` group (`ADMIN_GROUP`) **bypasses** host ACL.
+
+Example admin policies:
+
+| Host | Required groups |
+|---|---|
+| `grafana.example.com` | `engineer` |
+| `metabase.example.com` | `bd` |
+| `wiki.example.com` | `engineer`, `bd` |
+
+Host-policy edits apply on the next ForwardAuth request. Role→group mapping changes still require re-login or session revoke (groups are snapshotted at login).
 
 ## Multi-host cookies (required)
 
@@ -127,12 +151,13 @@ middlewares:
 |---|---|---|
 | `GET` | `/api/me` | Current session |
 | `GET/POST/DELETE` | `/api/mappings` | Role→group CRUD (admin) |
+| `GET/POST/DELETE` | `/api/host-policies` | Host→group ACL CRUD (admin). POST body: `{"host":"grafana.example.com","required_groups":["engineer"]}`. DELETE query: `?host=` |
 | `POST` | `/api/sessions/revoke` | Body `{"discord_user":"<id>"}` — revoke all sessions for a user (admin) |
 | `GET` | `/api/audit` | Paginated audit history (admin). Query: `limit` (default 25, max 100), `offset` (default 0) |
 
 State-changing admin routes also require same-origin (`Origin` / `Sec-Fetch-Site`).
 
-Audit events are recorded for mapping upsert/delete and session revoke. Response shape:
+Audit events are recorded for mapping upsert/delete, host-policy upsert/delete, and session revoke. Response shape:
 
 ```json
 {
@@ -166,7 +191,7 @@ Production UI is embedded: `cd web && npm run build` writes into `cmd/discord-au
 3. Empty groups or non-member → `403`. Discord/DB errors → fail-closed. A missing CSRF cookie (consumed/expired login) returns a distinct message from state mismatch.
 4. Session cookie set; Discord access token discarded.
 5. Redirect back to the original app host/path (host must be under `COOKIE_DOMAIN` or equal `AUTH_HOST`).
-6. Authenticated → `200` + `X-Auth-*` headers.
+6. Authenticated → host ACL check on `X-Forwarded-Host` → `200` + `X-Auth-*` headers, or `403` if the host has no policy / user lacks a required group (admins bypass).
 
 ## License
 
