@@ -171,7 +171,9 @@ func originalReturn(r *http.Request, cfg *config.Config) (path, host string) {
 	} else if r.URL.Path != "" && r.URL.Path != "/" {
 		path = SafeReturnPath(r.URL.RequestURI())
 	} else {
-		path = "/"
+		// Direct browse to AUTH_HOST root. "/" is the bodyless ForwardAuth
+		// endpoint; send humans to the admin UI after login instead.
+		path = "/admin/"
 	}
 
 	host = config.NormalizeHost(r.Header.Get("X-Forwarded-Host"))
