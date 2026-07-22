@@ -6,8 +6,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/yitech/discord-forward-auth/internal/config"
 )
 
 type PostgresStore struct {
@@ -41,7 +39,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]Policy, error) {
 }
 
 func (s *PostgresStore) Get(ctx context.Context, host string) (*Policy, error) {
-	host = config.NormalizeHost(host)
+	host = NormalizePattern(host)
 	var p Policy
 	err := s.pool.QueryRow(ctx, `
 		SELECT host, required_groups, updated_at, updated_by
@@ -57,11 +55,26 @@ func (s *PostgresStore) Get(ctx context.Context, host string) (*Policy, error) {
 	return &p, nil
 }
 
+func (s *PostgresStore) Match(ctx context.Context, host string) (*Policy, error) {
+	list, err := s.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matched, ok := BestMatch(host, list)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return matched, nil
+}
+
 func (s *PostgresStore) Upsert(ctx context.Context, host string, requiredGroups []string, updatedBy string) error {
-	host = config.NormalizeHost(host)
+	host = NormalizePattern(host)
 	groups := NormalizeGroups(requiredGroups)
 	if host == "" || len(groups) == 0 {
 		return ErrInvalid
+	}
+	if err := ValidatePattern(host); err != nil {
+		return err
 	}
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO host_group_policies (host, required_groups, updated_at, updated_by)
@@ -75,7 +88,7 @@ func (s *PostgresStore) Upsert(ctx context.Context, host string, requiredGroups 
 }
 
 func (s *PostgresStore) Delete(ctx context.Context, host string) error {
-	host = config.NormalizeHost(host)
+	host = NormalizePattern(host)
 	tag, err := s.pool.Exec(ctx, `
 		DELETE FROM host_group_policies
 		WHERE host = $1

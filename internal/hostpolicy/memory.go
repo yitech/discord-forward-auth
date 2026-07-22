@@ -5,8 +5,6 @@ import (
 	"sort"
 	"sync"
 	"time"
-
-	"github.com/yitech/discord-forward-auth/internal/config"
 )
 
 type MemoryStore struct {
@@ -32,7 +30,7 @@ func (s *MemoryStore) List(_ context.Context) ([]Policy, error) {
 func (s *MemoryStore) Get(_ context.Context, host string) (*Policy, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	host = config.NormalizeHost(host)
+	host = NormalizePattern(host)
 	p, ok := s.rows[host]
 	if !ok {
 		return nil, ErrNotFound
@@ -41,11 +39,28 @@ func (s *MemoryStore) Get(_ context.Context, host string) (*Policy, error) {
 	return &cp, nil
 }
 
+func (s *MemoryStore) Match(_ context.Context, host string) (*Policy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	policies := make([]Policy, 0, len(s.rows))
+	for _, p := range s.rows {
+		policies = append(policies, p)
+	}
+	matched, ok := BestMatch(host, policies)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return matched, nil
+}
+
 func (s *MemoryStore) Upsert(_ context.Context, host string, requiredGroups []string, updatedBy string) error {
-	host = config.NormalizeHost(host)
+	host = NormalizePattern(host)
 	groups := NormalizeGroups(requiredGroups)
 	if host == "" || len(groups) == 0 {
 		return ErrInvalid
+	}
+	if err := ValidatePattern(host); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -63,7 +78,7 @@ func (s *MemoryStore) Upsert(_ context.Context, host string, requiredGroups []st
 func (s *MemoryStore) Delete(_ context.Context, host string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	host = config.NormalizeHost(host)
+	host = NormalizePattern(host)
 	if _, ok := s.rows[host]; !ok {
 		return ErrNotFound
 	}
