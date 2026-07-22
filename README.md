@@ -21,16 +21,28 @@ Browser ──HTTPS──> Traefik ──ForwardAuth──> discord-auth
                  Protected app
 ```
 
-- Server-side opaque sessions in Postgres (revocable on logout).
+- Server-side opaque sessions in Postgres (revocable on logout or admin kick).
 - Role→group mappings edited in the admin UI at `https://<AUTH_HOST>/admin/`.
 - `BOOTSTRAP_ADMIN_ROLE_ID` always grants the admin group (break-glass / first admin).
+
+## Multi-host cookies (required)
+
+The documented topology is `auth.example.com` (OAuth callback + admin) plus apps like `app.example.com`.
+
+**You must set `COOKIE_DOMAIN` to the shared parent domain** (e.g. `.example.com`). Without it:
+
+1. The CSRF cookie is scoped to the app host during ForwardAuth, so the callback on `AUTH_HOST` fails with `403 invalid state`.
+2. The session cookie set on `AUTH_HOST` is never sent to the app host → login loop.
+
+Startup **fails** if `COOKIE_DOMAIN` is empty, unless you explicitly set `SINGLE_HOST=true` (only when `AUTH_HOST` itself is the sole protected host).
 
 ## Quick start (Docker Compose)
 
 1. Create a Discord application OAuth2 redirect: `https://<AUTH_HOST>/_oauth`
    - Scopes: `identify`, `guilds.members.read`
 2. Copy `.env.example` → `.env` and fill Discord + guild + bootstrap role IDs.
-3. Run:
+3. Set `COOKIE_DOMAIN=.example.com` (matching your real parent domain).
+4. Run:
 
 ```bash
 cd deploy
@@ -49,14 +61,17 @@ Service listens on `:4181`. Admin UI: `https://<AUTH_HOST>/admin/` (behind Traef
 | `DISCORD_GUILD_ID` | required | Allowed Discord guild |
 | `BOOTSTRAP_ADMIN_ROLE_ID` | required | Discord role that always maps to admin |
 | `DATABASE_URL` | required | Postgres connection string |
+| `COOKIE_DOMAIN` | required\* | Shared parent domain (e.g. `.example.com`) for multi-host |
+| `SINGLE_HOST` | `false` | Opt into host-only cookies when only `AUTH_HOST` is protected |
 | `SESSION_TTL` | `1800` | Session lifetime (seconds) |
 | `MAPPING_CACHE_TTL` | `30` | Role→group cache (seconds; `0` = no cache) |
 | `ADMIN_GROUP` | `admin` | Group required for admin UI/API |
-| `COOKIE_NAME` | `__Host-discord_auth_session` | Session cookie name |
-| `COOKIE_DOMAIN` | _(empty)_ | Set for shared subdomain cookies (e.g. `.example.com`) |
+| `COOKIE_NAME` | `__Host-discord_auth_session` | Session cookie name (`__Secure-` when domain set) |
 | `HEADER_USER` | `X-Auth-User` | Identity header name |
 | `HEADER_GROUPS` | `X-Auth-Groups` | Groups header name |
 | `LISTEN_ADDR` | `:4181` | HTTP listen address |
+
+\*Required unless `SINGLE_HOST=true`.
 
 ## Traefik
 
@@ -79,13 +94,23 @@ middlewares:
         - X-Auth-Groups
 ```
 
+## Admin API
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/me` | Current session |
+| `GET/POST/DELETE` | `/api/mappings` | Role→group CRUD (admin) |
+| `POST` | `/api/sessions/revoke` | Body `{"discord_user":"<id>"}` — revoke all sessions for a user (admin) |
+
+State-changing admin routes also require same-origin (`Origin` / `Sec-Fetch-Site`).
+
 ## Local development
 
 ```bash
 # Postgres
 docker compose -f deploy/docker-compose.yml up postgres -d
 
-# Backend
+# Backend (SINGLE_HOST=true is fine for local auth-host-only testing)
 export $(grep -v '^#' .env | xargs)
 go run ./cmd/discord-auth
 
@@ -101,7 +126,8 @@ Production UI is embedded: `cd web && npm run build` writes into `cmd/discord-au
 2. Callback `/_oauth` exchanges code, loads guild member roles, maps to groups.
 3. Empty groups or non-member → `403`. Discord/DB errors → fail-closed.
 4. Session cookie set; Discord access token discarded.
-5. Authenticated → `200` + `X-Auth-*` headers.
+5. Redirect back to the original app host/path (host must be under `COOKIE_DOMAIN` or equal `AUTH_HOST`).
+6. Authenticated → `200` + `X-Auth-*` headers.
 
 ## License
 

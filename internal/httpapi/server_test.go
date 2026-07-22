@@ -64,6 +64,7 @@ func testCfg() *config.Config {
 		DiscordGuildID:      "guild1",
 		SessionTTL:          time.Hour,
 		CookieName:          "discord_auth_session",
+		CookieDomain:        ".example.com",
 		CSRFCookieName:      "discord_auth_csrf",
 		AdminGroup:          "admin",
 		BootstrapAdminRole:  "boot-role",
@@ -83,10 +84,28 @@ func newTestServer(t *testing.T, d *discordMock, maps mapping.Store) (*httpapi.S
 	return srv, sess
 }
 
+func csrfFromLogin(t *testing.T, srv *httpapi.Server, path string, headers map[string]string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	for _, c := range rr.Result().Cookies() {
+		if c.Name == "discord_auth_csrf" {
+			return c.Value
+		}
+	}
+	t.Fatal("no csrf cookie")
+	return ""
+}
+
 func TestForwardAuthUnauthenticatedRedirects(t *testing.T) {
 	srv, _ := newTestServer(t, &discordMock{}, nil)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Forwarded-Uri", "/app/secret")
+	req.Header.Set("X-Forwarded-Host", "app.example.com")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusFound {
@@ -98,6 +117,9 @@ func TestForwardAuthUnauthenticatedRedirects(t *testing.T) {
 	}
 	if !strings.Contains(loc, "client_id=client") {
 		t.Fatalf("missing client_id: %s", loc)
+	}
+	if strings.Contains(loc, "prompt=") {
+		t.Fatalf("prompt should not be set: %s", loc)
 	}
 	cookies := rr.Result().Cookies()
 	var csrf string
@@ -162,20 +184,7 @@ func TestOAuthCallbackCSRFMismatch(t *testing.T) {
 func TestOAuthCallbackNotMember(t *testing.T) {
 	d := &discordMock{memberErr: discord.ErrNotGuildMember}
 	srv, _ := newTestServer(t, d, nil)
-
-	// Obtain a valid state via login redirect.
-	login := httptest.NewRequest(http.MethodGet, "/?rd=/admin/", nil)
-	loginRR := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(loginRR, login)
-	var state string
-	for _, c := range loginRR.Result().Cookies() {
-		if c.Name == "discord_auth_csrf" {
-			state = c.Value
-		}
-	}
-	if state == "" {
-		t.Fatal("no state")
-	}
+	state := csrfFromLogin(t, srv, "/?rd=/admin/", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/_oauth?code=abc&state="+state, nil)
 	req.AddCookie(&http.Cookie{Name: "discord_auth_csrf", Value: state})
@@ -189,16 +198,7 @@ func TestOAuthCallbackNotMember(t *testing.T) {
 func TestOAuthCallbackNoGroups(t *testing.T) {
 	d := &discordMock{member: &discord.Member{Roles: []string{"unmapped"}}}
 	srv, _ := newTestServer(t, d, mapping.NewMemoryStore())
-
-	login := httptest.NewRequest(http.MethodGet, "/", nil)
-	loginRR := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(loginRR, login)
-	var state string
-	for _, c := range loginRR.Result().Cookies() {
-		if c.Name == "discord_auth_csrf" {
-			state = c.Value
-		}
-	}
+	state := csrfFromLogin(t, srv, "/", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/_oauth?code=abc&state="+state, nil)
 	req.AddCookie(&http.Cookie{Name: "discord_auth_csrf", Value: state})
@@ -212,16 +212,7 @@ func TestOAuthCallbackNoGroups(t *testing.T) {
 func TestOAuthCallbackAPIFailureFailClosed(t *testing.T) {
 	d := &discordMock{tokenErr: errors.New("discord 500")}
 	srv, _ := newTestServer(t, d, nil)
-
-	login := httptest.NewRequest(http.MethodGet, "/", nil)
-	loginRR := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(loginRR, login)
-	var state string
-	for _, c := range loginRR.Result().Cookies() {
-		if c.Name == "discord_auth_csrf" {
-			state = c.Value
-		}
-	}
+	state := csrfFromLogin(t, srv, "/", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/_oauth?code=abc&state="+state, nil)
 	req.AddCookie(&http.Cookie{Name: "discord_auth_csrf", Value: state})
@@ -237,16 +228,7 @@ func TestOAuthCallbackSuccess(t *testing.T) {
 	_ = maps.Upsert(context.Background(), "guild1", "role-viewer", "viewer", "seed")
 	d := &discordMock{member: &discord.Member{Roles: []string{"role-viewer"}}}
 	srv, _ := newTestServer(t, d, maps)
-
-	login := httptest.NewRequest(http.MethodGet, "/?rd=/admin/", nil)
-	loginRR := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(loginRR, login)
-	var state string
-	for _, c := range loginRR.Result().Cookies() {
-		if c.Name == "discord_auth_csrf" {
-			state = c.Value
-		}
-	}
+	state := csrfFromLogin(t, srv, "/?rd=/admin/", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/_oauth?code=abc&state="+state, nil)
 	req.AddCookie(&http.Cookie{Name: "discord_auth_csrf", Value: state})
@@ -269,19 +251,32 @@ func TestOAuthCallbackSuccess(t *testing.T) {
 	}
 }
 
+func TestOAuthCallbackRedirectsToAppHost(t *testing.T) {
+	maps := mapping.NewMemoryStore()
+	_ = maps.Upsert(context.Background(), "guild1", "role-viewer", "viewer", "seed")
+	d := &discordMock{member: &discord.Member{Roles: []string{"role-viewer"}}}
+	srv, _ := newTestServer(t, d, maps)
+	state := csrfFromLogin(t, srv, "/", map[string]string{
+		"X-Forwarded-Uri":  "/dashboard",
+		"X-Forwarded-Host": "app.example.com",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/_oauth?code=abc&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: "discord_auth_csrf", Value: state})
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Location") != "https://app.example.com/dashboard" {
+		t.Fatalf("location=%s", rr.Header().Get("Location"))
+	}
+}
+
 func TestOAuthCallbackBootstrapAdmin(t *testing.T) {
 	d := &discordMock{member: &discord.Member{Roles: []string{"boot-role"}}}
 	srv, _ := newTestServer(t, d, mapping.NewMemoryStore())
-
-	login := httptest.NewRequest(http.MethodGet, "/", nil)
-	loginRR := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(loginRR, login)
-	var state string
-	for _, c := range loginRR.Result().Cookies() {
-		if c.Name == "discord_auth_csrf" {
-			state = c.Value
-		}
-	}
+	state := csrfFromLogin(t, srv, "/", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/_oauth?code=abc&state="+state, nil)
 	req.AddCookie(&http.Cookie{Name: "discord_auth_csrf", Value: state})
@@ -310,6 +305,12 @@ func TestLogoutRevokes(t *testing.T) {
 	}
 }
 
+func withOrigin(req *http.Request) *http.Request {
+	req.Header.Set("Origin", "https://auth.example.com")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	return req
+}
+
 func TestAdminMappingsAuthz(t *testing.T) {
 	maps := mapping.NewMemoryStore()
 	srv, store := newTestServer(t, &discordMock{}, maps)
@@ -317,7 +318,6 @@ func TestAdminMappingsAuthz(t *testing.T) {
 	viewer, _ := store.Create(context.Background(), "v1", []string{"viewer"}, time.Hour)
 	admin, _ := store.Create(context.Background(), "a1", []string{"admin"}, time.Hour)
 
-	// Non-admin forbidden
 	req := httptest.NewRequest(http.MethodGet, "/api/mappings", nil)
 	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: viewer.ID})
 	rr := httptest.NewRecorder()
@@ -326,9 +326,8 @@ func TestAdminMappingsAuthz(t *testing.T) {
 		t.Fatalf("viewer status=%d", rr.Code)
 	}
 
-	// Admin can upsert + list
 	body := `{"role_id":"r1","group_name":"operator"}`
-	req = httptest.NewRequest(http.MethodPost, "/api/mappings", strings.NewReader(body))
+	req = withOrigin(httptest.NewRequest(http.MethodPost, "/api/mappings", strings.NewReader(body)))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
 	rr = httptest.NewRecorder()
@@ -352,12 +351,56 @@ func TestAdminMappingsAuthz(t *testing.T) {
 		t.Fatalf("list=%v", list)
 	}
 
-	req = httptest.NewRequest(http.MethodDelete, "/api/mappings?role_id=r1&group_name=operator", nil)
+	req = withOrigin(httptest.NewRequest(http.MethodDelete, "/api/mappings?role_id=r1&group_name=operator", nil))
 	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
 	rr = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("delete status=%d", rr.Code)
+	}
+}
+
+func TestAdminMutationRejectsCrossSiteOrigin(t *testing.T) {
+	srv, store := newTestServer(t, &discordMock{}, nil)
+	admin, _ := store.Create(context.Background(), "a1", []string{"admin"}, time.Hour)
+	body := `{"role_id":"r1","group_name":"operator"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/mappings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://evil.example")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status=%d", rr.Code)
+	}
+}
+
+func TestRevokeUserSessions(t *testing.T) {
+	srv, store := newTestServer(t, &discordMock{}, nil)
+	admin, _ := store.Create(context.Background(), "a1", []string{"admin"}, time.Hour)
+	target, _ := store.Create(context.Background(), "victim", []string{"viewer"}, time.Hour)
+
+	body := `{"discord_user":"victim"}`
+	req := withOrigin(httptest.NewRequest(http.MethodPost, "/api/sessions/revoke", strings.NewReader(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, err := store.GetValid(context.Background(), target.ID); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("expected target revoked, err=%v", err)
+	}
+
+	// ForwardAuth should redirect revoked user
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: target.ID})
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("forwardauth status=%d", rr.Code)
 	}
 }
 

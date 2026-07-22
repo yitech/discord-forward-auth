@@ -35,9 +35,11 @@ services:
       SESSION_TTL: ${SESSION_TTL:-1800}
       MAPPING_CACHE_TTL: ${MAPPING_CACHE_TTL:-30}
       ADMIN_GROUP: ${ADMIN_GROUP:-admin}
-      # For shared auth-host cookies across subdomains, set e.g. .example.com
-      # and use COOKIE_NAME without __Host- prefix (auto-adjusted by the app).
+      # Required for multi-host (auth + apps on sibling subdomains).
+      # Example: COOKIE_DOMAIN=.example.com
+      # Or set SINGLE_HOST=true when only AUTH_HOST is protected.
       COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
+      SINGLE_HOST: ${SINGLE_HOST:-false}
       HEADER_USER: ${HEADER_USER:-X-Auth-User}
       HEADER_GROUPS: ${HEADER_GROUPS:-X-Auth-Groups}
 

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -63,8 +64,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /_oauth/logout", s.handleLogout)
 	mux.HandleFunc("GET /api/me", s.handleMe)
 	mux.HandleFunc("GET /api/mappings", s.requireAdmin(s.handleListMappings))
-	mux.HandleFunc("POST /api/mappings", s.requireAdmin(s.handleUpsertMapping))
-	mux.HandleFunc("DELETE /api/mappings", s.requireAdmin(s.handleDeleteMapping))
+	mux.HandleFunc("POST /api/mappings", s.requireAdmin(s.requireSameOrigin(s.handleUpsertMapping)))
+	mux.HandleFunc("DELETE /api/mappings", s.requireAdmin(s.requireSameOrigin(s.handleDeleteMapping)))
+	mux.HandleFunc("POST /api/sessions/revoke", s.requireAdmin(s.requireSameOrigin(s.handleRevokeSessions)))
 
 	if s.adminFS != nil {
 		mux.Handle("GET /admin/", s.adminHandler())
@@ -116,8 +118,8 @@ func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) redirectToLogin(w http.ResponseWriter, r *http.Request) {
-	returnPath := originalReturnPath(r)
-	state, err := encodeState(returnPath)
+	returnPath, returnHost := originalReturn(r, s.cfg)
+	state, err := encodeState(returnPath, returnHost)
 	if err != nil {
 		s.log.Error("encode state failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -131,24 +133,29 @@ func (s *Server) redirectToLogin(w http.ResponseWriter, r *http.Request) {
 	q.Set("redirect_uri", s.cfg.RedirectURI())
 	q.Set("scope", "identify guilds.members.read")
 	q.Set("state", state)
-	q.Set("prompt", "none")
 
 	http.Redirect(w, r, s.cfg.AuthorizeURL()+"?"+q.Encode(), http.StatusFound)
 }
 
-func originalReturnPath(r *http.Request) string {
+func originalReturn(r *http.Request, cfg *config.Config) (path, host string) {
 	// Explicit return target (admin UI login).
 	if rd := r.URL.Query().Get("rd"); rd != "" {
-		return SafeReturnPath(rd)
+		return SafeReturnPath(rd), ""
 	}
-	// Traefik ForwardAuth provides original URI via X-Forwarded-Uri.
+	// Traefik ForwardAuth provides original URI/host.
 	if uri := r.Header.Get("X-Forwarded-Uri"); uri != "" {
-		return SafeReturnPath(uri)
+		path = SafeReturnPath(uri)
+	} else if r.URL.Path != "" && r.URL.Path != "/" {
+		path = SafeReturnPath(r.URL.RequestURI())
+	} else {
+		path = "/"
 	}
-	if r.URL.Path != "" && r.URL.Path != "/" {
-		return SafeReturnPath(r.URL.RequestURI())
+
+	host = config.NormalizeHost(r.Header.Get("X-Forwarded-Host"))
+	if host != "" && !cfg.HostAllowed(host) {
+		host = ""
 	}
-	return "/"
+	return path, host
 }
 
 func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
@@ -166,13 +173,14 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	csrf, err := r.Cookie(s.cfg.CSRFCookieName)
-	if err != nil || csrf.Value == "" || csrf.Value != state {
+	if err != nil || csrf.Value == "" ||
+		subtle.ConstantTimeCompare([]byte(csrf.Value), []byte(state)) != 1 {
 		http.Error(w, "invalid state", http.StatusForbidden)
 		return
 	}
 	s.clearCSRFCookie(w)
 
-	st, err := decodeState(state)
+	st, err := decodeState(state, s.cfg)
 	if err != nil {
 		http.Error(w, "invalid state", http.StatusForbidden)
 		return
@@ -225,7 +233,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.setSessionCookie(w, sess.ID, sess.ExpiresAt)
-	http.Redirect(w, r, st.Return, http.StatusFound)
+	http.Redirect(w, r, ReturnURL(st.Return, st.Host, s.cfg.AuthHost), http.StatusFound)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -284,6 +292,36 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (s *Server) requireSameOrigin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.allowedMutationOrigin(r) {
+			http.Error(w, "forbidden origin", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) allowedMutationOrigin(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
+		switch site {
+		case "same-origin":
+			return true
+		case "cross-site", "same-site":
+			return false
+		}
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return config.NormalizeHost(u.Host) == config.NormalizeHost(s.cfg.AuthHost)
+}
+
 type sessionKey struct{}
 
 func sessionFromCtx(ctx context.Context) *session.Session {
@@ -294,6 +332,10 @@ func sessionFromCtx(ctx context.Context) *session.Session {
 type mappingRequest struct {
 	RoleID    string `json:"role_id"`
 	GroupName string `json:"group_name"`
+}
+
+type revokeRequest struct {
+	DiscordUser string `json:"discord_user"`
 }
 
 func (s *Server) handleListMappings(w http.ResponseWriter, r *http.Request) {
@@ -347,6 +389,31 @@ func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleRevokeSessions(w http.ResponseWriter, r *http.Request) {
+	var req revokeRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.DiscordUser = strings.TrimSpace(req.DiscordUser)
+	if req.DiscordUser == "" {
+		http.Error(w, "discord_user required", http.StatusBadRequest)
+		return
+	}
+
+	actor := ""
+	if sess := sessionFromCtx(r.Context()); sess != nil {
+		actor = sess.DiscordUser
+	}
+	if err := s.sessions.RevokeUser(r.Context(), req.DiscordUser); err != nil {
+		s.log.Error("revoke user sessions failed", "err", err, "target", req.DiscordUser, "by", actor)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	s.log.Info("revoked user sessions", "target", req.DiscordUser, "by", actor)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
