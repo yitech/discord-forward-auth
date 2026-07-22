@@ -40,6 +40,10 @@ Rules:
 - Hosts with **no policy** are **denied** (fail-closed) so a new Traefik app is not open to every logged-in guild member.
 - Empty/`AUTH_HOST` skips host ACL (direct auth-host traffic).
 - The `admin` group (`ADMIN_GROUP`) **bypasses** host ACL.
+- Host patterns may be an **exact hostname** or a **single-label DNS wildcard** (`*.example.com`).
+  - `*.example.com` matches `grafana.example.com`, not `example.com` and not `a.b.example.com`.
+  - When several patterns match, the **most specific** wins (exact over wildcard; longer fixed suffix over shorter).
+  - Full regex is not supported.
 
 Example admin policies:
 
@@ -48,6 +52,7 @@ Example admin policies:
 | `grafana.example.com` | `engineer` |
 | `metabase.example.com` | `bd` |
 | `wiki.example.com` | `engineer`, `bd` |
+| `*.apps.example.com` | `engineer` |
 
 Host-policy edits apply on the next ForwardAuth request. Role→group mapping changes still require re-login or session revoke (groups are snapshotted at login).
 
@@ -152,7 +157,7 @@ middlewares:
 |---|---|---|
 | `GET` | `/api/me` | Current session |
 | `GET/POST/DELETE` | `/api/mappings` | Role→group CRUD (admin) |
-| `GET/POST/DELETE` | `/api/host-policies` | Host→group ACL CRUD (admin). POST body: `{"host":"grafana.example.com","required_groups":["engineer"]}`. DELETE query: `?host=` |
+| `GET/POST/DELETE` | `/api/host-policies` | Host→group ACL CRUD (admin). POST body: `{"host":"grafana.example.com","required_groups":["engineer"]}` (host may be `*.example.com`). DELETE query: `?host=` |
 | `POST` | `/api/sessions/revoke` | Body `{"discord_user":"<id>"}` — revoke all sessions for a user (admin) |
 | `GET` | `/api/audit` | Paginated audit history (admin). Query: `limit` (default 25, max 100), `offset` (default 0) |
 

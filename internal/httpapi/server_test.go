@@ -348,6 +348,64 @@ func TestForwardAuthHostPolicy(t *testing.T) {
 	})
 }
 
+func TestForwardAuthHostPolicyWildcard(t *testing.T) {
+	hosts := hostpolicy.NewMemoryStore()
+	_ = hosts.Upsert(context.Background(), "*.example.com", []string{"engineer"}, "seed")
+	_ = hosts.Upsert(context.Background(), "grafana.example.com", []string{"bd"}, "seed")
+	srv, store, _ := newTestServerWithHosts(t, &discordMock{}, nil, hosts)
+
+	engineer, err := store.Create(context.Background(), "e1", []string{"engineer"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bd, err := store.Create(context.Background(), "b1", []string{"bd"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("wildcard match", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Forwarded-Host", "wiki.example.com")
+		req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: engineer.ID})
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("exact beats wildcard", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Forwarded-Host", "grafana.example.com")
+		req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: engineer.ID})
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("status=%d", rr.Code)
+		}
+
+		req = httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Forwarded-Host", "grafana.example.com")
+		req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: bd.ID})
+		rr = httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("deep subdomain no match", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Forwarded-Host", "a.b.example.com")
+		req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: engineer.ID})
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("status=%d", rr.Code)
+		}
+	})
+}
+
 func TestAdminHostPolicies(t *testing.T) {
 	hosts := hostpolicy.NewMemoryStore()
 	srv, store, aud := newTestServerWithHosts(t, &discordMock{}, nil, hosts)
@@ -362,6 +420,16 @@ func TestAdminHostPolicies(t *testing.T) {
 		t.Fatalf("viewer status=%d", rr.Code)
 	}
 
+	badBody := `{"host":"*","required_groups":["engineer"]}`
+	req = withOrigin(httptest.NewRequest(http.MethodPost, "/api/host-policies", strings.NewReader(badBody)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid pattern status=%d", rr.Code)
+	}
+
 	body := `{"host":"Grafana.Example.Com","required_groups":["engineer"," bd "]}`
 	req = withOrigin(httptest.NewRequest(http.MethodPost, "/api/host-policies", strings.NewReader(body)))
 	req.Header.Set("Content-Type", "application/json")
@@ -370,6 +438,16 @@ func TestAdminHostPolicies(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("upsert status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	wildBody := `{"host":"*.apps.example.com","required_groups":["engineer"]}`
+	req = withOrigin(httptest.NewRequest(http.MethodPost, "/api/host-policies", strings.NewReader(wildBody)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("wildcard upsert status=%d body=%s", rr.Code, rr.Body.String())
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/host-policies", nil)
@@ -383,8 +461,18 @@ func TestAdminHostPolicies(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&list); err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 1 || list[0].Host != "grafana.example.com" || len(list[0].RequiredGroups) != 2 {
+	if len(list) != 2 {
 		t.Fatalf("list=%v", list)
+	}
+	byHost := map[string]hostpolicy.Policy{}
+	for _, p := range list {
+		byHost[p.Host] = p
+	}
+	if p, ok := byHost["grafana.example.com"]; !ok || len(p.RequiredGroups) != 2 {
+		t.Fatalf("exact policy=%v", byHost["grafana.example.com"])
+	}
+	if p, ok := byHost["*.apps.example.com"]; !ok || len(p.RequiredGroups) != 1 {
+		t.Fatalf("wildcard policy=%v", byHost["*.apps.example.com"])
 	}
 
 	req = withOrigin(httptest.NewRequest(http.MethodDelete, "/api/host-policies?host=grafana.example.com", nil))
@@ -399,11 +487,13 @@ func TestAdminHostPolicies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 2 {
+	if total != 3 {
 		t.Fatalf("audit total=%d", total)
 	}
-	if events[0].Action != audit.ActionHostPolicyDelete || events[1].Action != audit.ActionHostPolicyUpsert {
-		t.Fatalf("actions=%s,%s", events[0].Action, events[1].Action)
+	if events[0].Action != audit.ActionHostPolicyDelete ||
+		events[1].Action != audit.ActionHostPolicyUpsert ||
+		events[2].Action != audit.ActionHostPolicyUpsert {
+		t.Fatalf("actions=%s,%s,%s", events[0].Action, events[1].Action, events[2].Action)
 	}
 }
 

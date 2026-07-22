@@ -434,12 +434,13 @@
       <h2 class="section-title">Host → group policies</h2>
       <p class="muted" style="margin-top: 0">
         Protected hosts without a policy are denied (fail-closed). User needs any listed group;
-        <span class="mono">{me.admin_group}</span> always bypasses.
+        <span class="mono">{me.admin_group}</span> always bypasses. Exact hosts or single-label
+        wildcards like <span class="mono">*.example.com</span> (most specific match wins).
       </p>
       <form class="form-row" onsubmit={addHostPolicy}>
         <input
           bind:value={policyHost}
-          placeholder="Hostname (e.g. grafana.example.com)"
+          placeholder="Host or *.example.com"
           required
           class="mono"
           autocomplete="off"

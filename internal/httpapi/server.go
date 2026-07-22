@@ -179,7 +179,7 @@ func (s *Server) hostAccessAllowed(ctx context.Context, w http.ResponseWriter, h
 		return true
 	}
 
-	policy, err := s.hosts.Get(ctx, host)
+	policy, err := s.hosts.Match(ctx, host)
 	if err != nil && !errors.Is(err, hostpolicy.ErrNotFound) {
 		s.log.Error("host policy lookup failed", "err", err, "host", host)
 		http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
@@ -578,10 +578,14 @@ func (s *Server) handleUpsertHostPolicy(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	host := config.NormalizeHost(req.Host)
+	host := hostpolicy.NormalizePattern(req.Host)
 	groups := hostpolicy.NormalizeGroups(req.RequiredGroups)
 	if host == "" || len(groups) == 0 {
 		http.Error(w, "host and required_groups required", http.StatusBadRequest)
+		return
+	}
+	if err := hostpolicy.ValidatePattern(host); err != nil {
+		http.Error(w, "invalid host pattern", http.StatusBadRequest)
 		return
 	}
 	if host == config.NormalizeHost(s.cfg.AuthHost) {
@@ -599,6 +603,10 @@ func (s *Server) handleUpsertHostPolicy(w http.ResponseWriter, r *http.Request) 
 		updatedBy = sess.DiscordUser
 	}
 	if err := s.hosts.Upsert(r.Context(), host, groups, updatedBy); err != nil {
+		if errors.Is(err, hostpolicy.ErrInvalidPattern) {
+			http.Error(w, "invalid host pattern", http.StatusBadRequest)
+			return
+		}
 		s.log.Error("upsert host policy failed", "err", err)
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
@@ -611,7 +619,7 @@ func (s *Server) handleUpsertHostPolicy(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleDeleteHostPolicy(w http.ResponseWriter, r *http.Request) {
-	host := config.NormalizeHost(r.URL.Query().Get("host"))
+	host := hostpolicy.NormalizePattern(r.URL.Query().Get("host"))
 	if host == "" {
 		http.Error(w, "host required", http.StatusBadRequest)
 		return
