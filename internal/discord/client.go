@@ -29,7 +29,7 @@ type Client struct {
 func NewClient(clientID, clientSecret, redirectURI string) *Client {
 	return &Client{
 		HTTP: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 15 * time.Second,
 		},
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
@@ -57,6 +57,29 @@ type Member struct {
 }
 
 func (c *Client) ExchangeCode(ctx context.Context, code string) (*TokenResponse, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		tok, err := c.exchangeCodeOnce(ctx, code)
+		if err == nil {
+			return tok, nil
+		}
+		lastErr = err
+		// Discord API errors are not helped by a blind retry (and codes are single-use).
+		if errors.Is(err, ErrAPI) {
+			return nil, err
+		}
+		if attempt == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *Client) exchangeCodeOnce(ctx context.Context, code string) (*TokenResponse, error) {
 	form := url.Values{}
 	form.Set("client_id", c.ClientID)
 	form.Set("client_secret", c.ClientSecret)
