@@ -1,4 +1,6 @@
 <script>
+  const AUDIT_PAGE_SIZE = 25
+
   let me = $state(null)
   let mappings = $state([])
   let loading = $state(true)
@@ -9,6 +11,12 @@
   let revokeUser = $state('')
   let revoking = $state(false)
   let notice = $state('')
+
+  let auditItems = $state([])
+  let auditTotal = $state(0)
+  let auditOffset = $state(0)
+  let auditLoading = $state(false)
+  let auditError = $state('')
 
   async function load() {
     loading = true
@@ -33,10 +41,34 @@
         throw new Error('Failed to load mappings')
       }
       mappings = await mapRes.json()
+      await loadAudit(auditOffset)
     } catch (e) {
       error = e.message || 'Unexpected error'
     } finally {
       loading = false
+    }
+  }
+
+  async function loadAudit(offset = 0) {
+    auditLoading = true
+    auditError = ''
+    try {
+      const qs = new URLSearchParams({
+        limit: String(AUDIT_PAGE_SIZE),
+        offset: String(Math.max(0, offset)),
+      })
+      const res = await fetch(`/api/audit?${qs}`, { credentials: 'same-origin' })
+      if (!res.ok) {
+        throw new Error('Failed to load audit history')
+      }
+      const page = await res.json()
+      auditItems = page.items || []
+      auditTotal = page.total || 0
+      auditOffset = page.offset || 0
+    } catch (e) {
+      auditError = e.message || 'Failed to load audit history'
+    } finally {
+      auditLoading = false
     }
   }
 
@@ -107,6 +139,7 @@
       }
       notice = `Revoked sessions for ${target}`
       revokeUser = ''
+      await loadAudit(0)
     } catch (e) {
       error = e.message || 'Failed to revoke'
     } finally {
@@ -121,6 +154,47 @@
   async function signOut() {
     await fetch('/_oauth/logout', { credentials: 'same-origin' })
     window.location.href = '/admin/'
+  }
+
+  function formatAction(action) {
+    switch (action) {
+      case 'mapping.upsert':
+        return 'Mapping upsert'
+      case 'mapping.delete':
+        return 'Mapping delete'
+      case 'session.revoke_user':
+        return 'Revoke sessions'
+      default:
+        return action
+    }
+  }
+
+  function formatDetails(details) {
+    if (!details || typeof details !== 'object') return '—'
+    if (details.group_name && details.role_id) {
+      return `${details.group_name} ← ${details.role_id}`
+    }
+    if (details.discord_user) {
+      return details.discord_user
+    }
+    const keys = Object.keys(details)
+    if (keys.length === 0) return '—'
+    return JSON.stringify(details)
+  }
+
+  function auditRangeLabel() {
+    if (auditTotal === 0) return '0 events'
+    const start = auditOffset + 1
+    const end = Math.min(auditOffset + auditItems.length, auditTotal)
+    return `${start}–${end} of ${auditTotal}`
+  }
+
+  function canPrevAudit() {
+    return auditOffset > 0
+  }
+
+  function canNextAudit() {
+    return auditOffset + AUDIT_PAGE_SIZE < auditTotal
   }
 
   $effect(() => {
@@ -230,6 +304,68 @@
           {revoking ? 'Revoking…' : 'Revoke sessions'}
         </button>
       </form>
+    </div>
+
+    <div class="panel" style="margin-top: 1.25rem">
+      <div class="section-header">
+        <div>
+          <h2 class="section-title">Audit history</h2>
+          <p class="muted" style="margin: 0">
+            Mapping changes and session revokes. Newest first.
+          </p>
+        </div>
+        <span class="muted">{auditRangeLabel()}</span>
+      </div>
+
+      {#if auditError}
+        <p class="error">{auditError}</p>
+      {/if}
+
+      {#if auditLoading && auditItems.length === 0}
+        <p class="empty">Loading audit history…</p>
+      {:else if auditItems.length === 0}
+        <p class="empty">No audit events yet.</p>
+      {:else}
+        <table>
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Action</th>
+              <th>Actor</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each auditItems as e (e.id)}
+              <tr class:dim={auditLoading}>
+                <td class="muted">{e.at ? new Date(e.at).toLocaleString() : '—'}</td>
+                <td>{formatAction(e.action)}</td>
+                <td class="mono muted">{e.actor || '—'}</td>
+                <td class="mono muted">{formatDetails(e.details)}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+
+      <div class="pager">
+        <button
+          type="button"
+          class="secondary"
+          disabled={!canPrevAudit() || auditLoading}
+          onclick={() => loadAudit(Math.max(0, auditOffset - AUDIT_PAGE_SIZE))}
+        >
+          Previous
+        </button>
+        <button
+          type="button"
+          class="secondary"
+          disabled={!canNextAudit() || auditLoading}
+          onclick={() => loadAudit(auditOffset + AUDIT_PAGE_SIZE)}
+        >
+          Next
+        </button>
+      </div>
     </div>
   {/if}
 </main>
