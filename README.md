@@ -143,9 +143,9 @@ Production UI is embedded: `cd web && npm run build` writes into `cmd/discord-au
 
 ## Auth flow (summary)
 
-1. Unauthenticated ForwardAuth → `302` to Discord authorize (`state` + CSRF cookie).
-2. Callback `/_oauth` exchanges code, loads guild member roles, maps to groups.
-3. Empty groups or non-member → `403`. Discord/DB errors → fail-closed.
+1. Unauthenticated **top-level** ForwardAuth (`Sec-Fetch-Mode: navigate` / `Sec-Fetch-Dest: document`, or HTML `Accept`) → `302` to Discord authorize (`state` + CSRF cookie). Sub-resource requests get bare `401` so they cannot clobber the CSRF cookie.
+2. Callback `/_oauth` exchanges code (one transport retry; 15s client timeout), loads guild member roles, maps to groups.
+3. Empty groups or non-member → `403`. Discord/DB errors → fail-closed. A missing CSRF cookie (consumed/expired login) returns a distinct message from state mismatch.
 4. Session cookie set; Discord access token discarded.
 5. Redirect back to the original app host/path (host must be under `COOKIE_DOMAIN` or equal `AUTH_HOST`).
 6. Authenticated → `200` + `X-Auth-*` headers.

@@ -88,7 +88,7 @@ func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
 
 	id := s.sessionIDFromRequest(r)
 	if id == "" {
-		s.redirectToLogin(w, r)
+		s.unauthenticated(w, r)
 		return
 	}
 
@@ -96,7 +96,7 @@ func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, session.ErrNotFound) {
 			s.clearSessionCookie(w)
-			s.redirectToLogin(w, r)
+			s.unauthenticated(w, r)
 			return
 		}
 		s.log.Error("session lookup failed", "err", err)
@@ -115,6 +115,29 @@ func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(s.cfg.HeaderUser, sess.DiscordUser)
 	w.Header().Set(s.cfg.HeaderGroups, strings.Join(sess.Groups, ","))
 	w.WriteHeader(http.StatusOK)
+}
+
+// unauthenticated starts OAuth only for top-level navigations. Sub-resource
+// ForwardAuth requests (CSS/JS/images/favicon) get a bare 401 so they cannot
+// clobber the single CSRF cookie slot used by the document's login redirect.
+func (s *Server) unauthenticated(w http.ResponseWriter, r *http.Request) {
+	if !isLoginNavigation(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	s.redirectToLogin(w, r)
+}
+
+func isLoginNavigation(r *http.Request) bool {
+	mode := r.Header.Get("Sec-Fetch-Mode")
+	dest := r.Header.Get("Sec-Fetch-Dest")
+	if mode != "" || dest != "" {
+		return mode == "navigate" || dest == "document"
+	}
+	// Clients without Fetch Metadata (curl, older browsers): treat HTML-ish
+	// Accept (or empty) as a navigation; otherwise refuse like a sub-resource.
+	accept := r.Header.Get("Accept")
+	return accept == "" || strings.Contains(accept, "text/html") || accept == "*/*"
 }
 
 func (s *Server) redirectToLogin(w http.ResponseWriter, r *http.Request) {
@@ -173,8 +196,16 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	csrf, err := r.Cookie(s.cfg.CSRFCookieName)
-	if err != nil || csrf.Value == "" ||
-		subtle.ConstantTimeCompare([]byte(csrf.Value), []byte(state)) != 1 {
+	if err != nil || csrf.Value == "" {
+		// Cookie already cleared after a prior callback (e.g. failed token
+		// exchange) or never set — distinct from a state mismatch so operators
+		// do not chase COOKIE_DOMAIN when the real fault was a consumed login.
+		s.log.Warn("oauth callback missing csrf cookie")
+		http.Error(w, "login session expired or already used; start login again", http.StatusForbidden)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(csrf.Value), []byte(state)) != 1 {
+		s.log.Warn("oauth callback state mismatch")
 		http.Error(w, "invalid state", http.StatusForbidden)
 		return
 	}
@@ -182,6 +213,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	st, err := decodeState(state, s.cfg)
 	if err != nil {
+		s.log.Warn("oauth callback invalid state payload", "err", err)
 		http.Error(w, "invalid state", http.StatusForbidden)
 		return
 	}
@@ -190,7 +222,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	tok, err := s.discord.ExchangeCode(ctx, code)
 	if err != nil {
 		s.log.Error("token exchange failed", "err", err)
-		http.Error(w, "authentication failed", http.StatusForbidden)
+		http.Error(w, "authentication failed; start login again", http.StatusForbidden)
 		return
 	}
 

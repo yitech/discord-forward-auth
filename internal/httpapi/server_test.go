@@ -106,6 +106,8 @@ func TestForwardAuthUnauthenticatedRedirects(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Forwarded-Uri", "/app/secret")
 	req.Header.Set("X-Forwarded-Host", "app.example.com")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusFound {
@@ -130,6 +132,72 @@ func TestForwardAuthUnauthenticatedRedirects(t *testing.T) {
 	}
 	if csrf == "" {
 		t.Fatal("expected csrf cookie")
+	}
+}
+
+func TestForwardAuthSubresourceDoesNotMintCSRF(t *testing.T) {
+	srv, _ := newTestServer(t, &discordMock{}, nil)
+
+	// Document navigation mints the CSRF cookie once.
+	nav := httptest.NewRequest(http.MethodGet, "/", nil)
+	nav.Header.Set("X-Forwarded-Uri", "/")
+	nav.Header.Set("X-Forwarded-Host", "app.example.com")
+	nav.Header.Set("Sec-Fetch-Mode", "navigate")
+	nav.Header.Set("Sec-Fetch-Dest", "document")
+	navRR := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(navRR, nav)
+	if navRR.Code != http.StatusFound {
+		t.Fatalf("nav status=%d", navRR.Code)
+	}
+	var navCSRF string
+	for _, c := range navRR.Result().Cookies() {
+		if c.Name == "discord_auth_csrf" {
+			navCSRF = c.Value
+		}
+	}
+	if navCSRF == "" {
+		t.Fatal("expected csrf from navigation")
+	}
+
+	// Parallel sub-resource ForwardAuth must not overwrite that cookie.
+	for _, dest := range []string{"style", "script", "image", "empty"} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Forwarded-Uri", "/assets/app.css")
+		req.Header.Set("X-Forwarded-Host", "app.example.com")
+		req.Header.Set("Sec-Fetch-Mode", "no-cors")
+		req.Header.Set("Sec-Fetch-Dest", dest)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("dest=%s status=%d", dest, rr.Code)
+		}
+		for _, c := range rr.Result().Cookies() {
+			if c.Name == "discord_auth_csrf" {
+				t.Fatalf("dest=%s set csrf cookie %q", dest, c.Value)
+			}
+		}
+	}
+}
+
+func TestForwardAuthAcceptHTMLWithoutFetchMetadata(t *testing.T) {
+	srv, _ := newTestServer(t, &discordMock{}, nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status=%d", rr.Code)
+	}
+}
+
+func TestForwardAuthNonHTMLAcceptWithoutFetchMetadata(t *testing.T) {
+	srv, _ := newTestServer(t, &discordMock{}, nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept", "image/avif,image/webp,image/*")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d", rr.Code)
 	}
 }
 
@@ -178,6 +246,22 @@ func TestOAuthCallbackCSRFMismatch(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status=%d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "invalid state") {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
+func TestOAuthCallbackMissingCSRFCookie(t *testing.T) {
+	srv, _ := newTestServer(t, &discordMock{}, nil)
+	req := httptest.NewRequest(http.MethodGet, "/_oauth?code=abc&state=xyz", nil)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "login session expired or already used") {
+		t.Fatalf("body=%s", rr.Body.String())
 	}
 }
 
