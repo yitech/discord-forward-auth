@@ -335,6 +335,30 @@ func TestOAuthCallbackSuccess(t *testing.T) {
 	}
 }
 
+// Direct browse to AUTH_HOST / has no X-Forwarded-Uri; post-login must not
+// land on the bodyless ForwardAuth endpoint (issue #5).
+func TestOAuthCallbackDirectAuthHostRootReturnsAdmin(t *testing.T) {
+	maps := mapping.NewMemoryStore()
+	_ = maps.Upsert(context.Background(), "guild1", "role-viewer", "viewer", "seed")
+	d := &discordMock{member: &discord.Member{Roles: []string{"role-viewer"}}}
+	srv, _ := newTestServer(t, d, maps)
+	state := csrfFromLogin(t, srv, "/", map[string]string{
+		"Sec-Fetch-Mode": "navigate",
+		"Sec-Fetch-Dest": "document",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/_oauth?code=abc&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: "discord_auth_csrf", Value: state})
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Location") != "/admin/" {
+		t.Fatalf("location=%s", rr.Header().Get("Location"))
+	}
+}
+
 func TestOAuthCallbackRedirectsToAppHost(t *testing.T) {
 	maps := mapping.NewMemoryStore()
 	_ = maps.Upsert(context.Background(), "guild1", "role-viewer", "viewer", "seed")
@@ -368,6 +392,9 @@ func TestOAuthCallbackBootstrapAdmin(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusFound {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Location") != "/admin/" {
+		t.Fatalf("location=%s", rr.Header().Get("Location"))
 	}
 }
 
