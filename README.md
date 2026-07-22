@@ -157,11 +157,17 @@ middlewares:
 
 State-changing admin routes also require same-origin (`Origin` / `Sec-Fetch-Site`).
 
-Audit events are recorded for mapping upsert/delete, host-policy upsert/delete, and session revoke. Response shape:
+Audit events are recorded for:
+
+- `login.success` / `login.denied` — Discord user id, username, client IP (`X-Forwarded-For` / `X-Real-IP` / remote addr), groups or deny reason, return host/path
+- `session.logout` — user + IP
+- mapping upsert/delete, host-policy upsert/delete, session revoke
+
+Response shape:
 
 ```json
 {
-  "items": [{"id": 1, "at": "...", "actor": "...", "action": "mapping.upsert", "target": "...", "details": {}}],
+  "items": [{"id": 1, "at": "...", "actor": "...", "action": "login.success", "target": "...", "details": {"ip": "...", "username": "...", "groups": ["admin"]}}],
   "total": 42,
   "limit": 25,
   "offset": 0

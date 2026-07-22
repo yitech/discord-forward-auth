@@ -289,6 +289,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	// Access token intentionally discarded after this point.
 	tok = nil
 	if errors.Is(err, discord.ErrNotGuildMember) {
+		s.recordLoginAudit(r, user, audit.ActionLoginDenied, nil, "not_guild_member", st)
 		http.Error(w, "not a guild member", http.StatusForbidden)
 		return
 	}
@@ -305,6 +306,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(groups) == 0 {
+		s.recordLoginAudit(r, user, audit.ActionLoginDenied, nil, "no_authorized_groups", st)
 		http.Error(w, "no authorized groups", http.StatusForbidden)
 		return
 	}
@@ -316,17 +318,54 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.recordLoginAudit(r, user, audit.ActionLoginSuccess, groups, "", st)
 	s.setSessionCookie(w, sess.ID, sess.ExpiresAt)
 	http.Redirect(w, r, ReturnURL(st.Return, st.Host, s.cfg.AuthHost), http.StatusFound)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	actor := ""
 	if id := s.sessionIDFromRequest(r); id != "" {
+		if sess, err := s.sessions.GetValid(r.Context(), id); err == nil && sess != nil {
+			actor = sess.DiscordUser
+		}
 		_ = s.sessions.Revoke(r.Context(), id)
+	}
+	if actor != "" {
+		s.recordAudit(r.Context(), actor, audit.ActionLogout, actor, map[string]any{
+			"ip":           clientIP(r),
+			"discord_user": actor,
+		})
 	}
 	s.clearSessionCookie(w)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("logged out"))
+}
+
+func (s *Server) recordLoginAudit(r *http.Request, user *discord.User, action string, groups []string, reason string, st oauthState) {
+	if user == nil {
+		return
+	}
+	details := map[string]any{
+		"ip":           clientIP(r),
+		"discord_user": user.ID,
+	}
+	if user.Username != "" {
+		details["username"] = user.Username
+	}
+	if reason != "" {
+		details["reason"] = reason
+	}
+	if len(groups) > 0 {
+		details["groups"] = groups
+	}
+	if st.Host != "" {
+		details["return_host"] = st.Host
+	}
+	if st.Return != "" {
+		details["return_path"] = st.Return
+	}
+	s.recordAudit(r.Context(), user.ID, action, user.ID, details)
 }
 
 func (s *Server) currentSession(ctx context.Context, r *http.Request) (*session.Session, error) {

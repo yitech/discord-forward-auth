@@ -227,6 +227,12 @@
         return 'Host policy delete'
       case 'session.revoke_user':
         return 'Revoke sessions'
+      case 'login.success':
+        return 'Login success'
+      case 'login.denied':
+        return 'Login denied'
+      case 'session.logout':
+        return 'Logout'
       default:
         return action
     }
@@ -242,6 +248,17 @@
     }
     if (details.host) {
       return details.host
+    }
+    if (details.reason || Array.isArray(details.groups) || details.return_path || details.return_host) {
+      const parts = []
+      if (details.reason) parts.push(details.reason)
+      if (Array.isArray(details.groups) && details.groups.length) {
+        parts.push(`groups=${details.groups.join(',')}`)
+      }
+      if (details.return_host || details.return_path) {
+        parts.push(`${details.return_host || ''}${details.return_path || ''}`)
+      }
+      return parts.join(' · ') || '—'
     }
     if (details.discord_user) {
       return details.discord_user
@@ -440,7 +457,7 @@
         <div>
           <h2 class="section-title">Audit history</h2>
           <p class="muted" style="margin: 0">
-            Mapping, host policy, and session revoke events. Newest first.
+            Logins (time, user, IP), logouts, mapping/host-policy changes, and session revokes. Newest first.
           </p>
         </div>
         <span class="muted">{auditRangeLabel()}</span>
@@ -461,6 +478,7 @@
               <th>When</th>
               <th>Action</th>
               <th>Actor</th>
+              <th>IP</th>
               <th>Details</th>
             </tr>
           </thead>
@@ -469,7 +487,8 @@
               <tr class:dim={auditLoading}>
                 <td class="muted">{e.at ? new Date(e.at).toLocaleString() : '—'}</td>
                 <td>{formatAction(e.action)}</td>
-                <td class="mono muted">{e.actor || '—'}</td>
+                <td class="mono muted">{e.details?.username || e.actor || '—'}</td>
+                <td class="mono muted">{e.details?.ip || '—'}</td>
                 <td class="mono muted">{formatDetails(e.details)}</td>
               </tr>
             {/each}
