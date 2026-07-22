@@ -3,11 +3,15 @@
 
   let me = $state(null)
   let mappings = $state([])
+  let hostPolicies = $state([])
   let loading = $state(true)
   let error = $state('')
   let roleId = $state('')
   let groupName = $state('')
   let saving = $state(false)
+  let policyHost = $state('')
+  let policyGroups = $state('')
+  let savingPolicy = $state(false)
   let revokeUser = $state('')
   let revoking = $state(false)
   let notice = $state('')
@@ -36,11 +40,18 @@
         loading = false
         return
       }
-      const mapRes = await fetch('/api/mappings', { credentials: 'same-origin' })
+      const [mapRes, hostRes] = await Promise.all([
+        fetch('/api/mappings', { credentials: 'same-origin' }),
+        fetch('/api/host-policies', { credentials: 'same-origin' }),
+      ])
       if (!mapRes.ok) {
         throw new Error('Failed to load mappings')
       }
+      if (!hostRes.ok) {
+        throw new Error('Failed to load host policies')
+      }
       mappings = await mapRes.json()
+      hostPolicies = await hostRes.json()
       await loadAudit(auditOffset)
     } catch (e) {
       error = e.message || 'Unexpected error'
@@ -119,6 +130,54 @@
     }
   }
 
+  async function addHostPolicy(e) {
+    e.preventDefault()
+    savingPolicy = true
+    error = ''
+    notice = ''
+    try {
+      const required_groups = policyGroups
+        .split(',')
+        .map((g) => g.trim())
+        .filter(Boolean)
+      const res = await fetch('/api/host-policies', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: policyHost.trim(), required_groups }),
+      })
+      if (!res.ok) {
+        throw new Error(await res.text())
+      }
+      policyHost = ''
+      policyGroups = ''
+      await load()
+    } catch (e) {
+      error = e.message || 'Failed to save host policy'
+    } finally {
+      savingPolicy = false
+    }
+  }
+
+  async function removeHostPolicy(p) {
+    if (!confirm(`Delete host policy for ${p.host}?`)) return
+    error = ''
+    notice = ''
+    try {
+      const qs = new URLSearchParams({ host: p.host })
+      const res = await fetch(`/api/host-policies?${qs}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+      })
+      if (!res.ok) {
+        throw new Error(await res.text())
+      }
+      await load()
+    } catch (e) {
+      error = e.message || 'Failed to delete host policy'
+    }
+  }
+
   async function revokeSessions(e) {
     e.preventDefault()
     const target = revokeUser.trim()
@@ -162,6 +221,10 @@
         return 'Mapping upsert'
       case 'mapping.delete':
         return 'Mapping delete'
+      case 'host_policy.upsert':
+        return 'Host policy upsert'
+      case 'host_policy.delete':
+        return 'Host policy delete'
       case 'session.revoke_user':
         return 'Revoke sessions'
       default:
@@ -173,6 +236,12 @@
     if (!details || typeof details !== 'object') return '—'
     if (details.group_name && details.role_id) {
       return `${details.group_name} ← ${details.role_id}`
+    }
+    if (details.host && Array.isArray(details.required_groups)) {
+      return `${details.host} ← ${details.required_groups.join(', ')}`
+    }
+    if (details.host) {
+      return details.host
     }
     if (details.discord_user) {
       return details.discord_user
@@ -208,7 +277,7 @@
   {:else if !me}
     <div class="center panel">
       <h1>Discord Forward Auth</h1>
-      <p class="muted">Sign in with Discord to manage role → group mappings.</p>
+      <p class="muted">Sign in with Discord to manage role → group mappings and host policies.</p>
       <button type="button" onclick={signIn}>Sign in with Discord</button>
     </div>
   {:else if !me.admin}
@@ -223,7 +292,7 @@
   {:else}
     <div class="header">
       <div>
-        <h1>Role → group mappings</h1>
+        <h1>Discord Forward Auth</h1>
         <p class="muted">
           Guild <span class="mono">{me.guild_id}</span>
           · admin <span class="mono">{me.discord_user}</span>
@@ -232,7 +301,18 @@
       <button type="button" class="secondary" onclick={signOut}>Sign out</button>
     </div>
 
+    {#if error}
+      <p class="error">{error}</p>
+    {/if}
+    {#if notice}
+      <p class="notice">{notice}</p>
+    {/if}
+
     <div class="panel">
+      <h2 class="section-title">Role → group mappings</h2>
+      <p class="muted" style="margin-top: 0">
+        Map Discord role IDs to session groups (emitted as <span class="mono">X-Auth-Groups</span>).
+      </p>
       <form class="form-row" onsubmit={addMapping}>
         <input
           bind:value={roleId}
@@ -243,19 +323,12 @@
         />
         <input
           bind:value={groupName}
-          placeholder="Group name (e.g. operator)"
+          placeholder="Group name (e.g. engineer)"
           required
           autocomplete="off"
         />
         <button type="submit" disabled={saving}>{saving ? 'Saving…' : 'Add'}</button>
       </form>
-
-      {#if error}
-        <p class="error">{error}</p>
-      {/if}
-      {#if notice}
-        <p class="notice">{notice}</p>
-      {/if}
 
       {#if mappings.length === 0}
         <p class="empty">No mappings yet. Bootstrap admins use BOOTSTRAP_ADMIN_ROLE_ID until you add rows here.</p>
@@ -288,6 +361,62 @@
     </div>
 
     <div class="panel" style="margin-top: 1.25rem">
+      <h2 class="section-title">Host → group policies</h2>
+      <p class="muted" style="margin-top: 0">
+        Protected hosts without a policy are denied (fail-closed). User needs any listed group;
+        <span class="mono">{me.admin_group}</span> always bypasses.
+      </p>
+      <form class="form-row" onsubmit={addHostPolicy}>
+        <input
+          bind:value={policyHost}
+          placeholder="Hostname (e.g. grafana.example.com)"
+          required
+          class="mono"
+          autocomplete="off"
+        />
+        <input
+          bind:value={policyGroups}
+          placeholder="Required groups (comma-separated)"
+          required
+          autocomplete="off"
+        />
+        <button type="submit" disabled={savingPolicy}>{savingPolicy ? 'Saving…' : 'Add'}</button>
+      </form>
+
+      {#if hostPolicies.length === 0}
+        <p class="empty">
+          No host policies yet. Until you add rows, ForwardAuth to app hosts will return 403
+          (except admin).
+        </p>
+      {:else}
+        <table>
+          <thead>
+            <tr>
+              <th>Host</th>
+              <th>Required groups</th>
+              <th>Updated</th>
+              <th>By</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each hostPolicies as p (p.host)}
+              <tr>
+                <td class="mono">{p.host}</td>
+                <td>{(p.required_groups || []).join(', ')}</td>
+                <td class="muted">{p.updated_at ? new Date(p.updated_at).toLocaleString() : '—'}</td>
+                <td class="mono muted">{p.updated_by || '—'}</td>
+                <td>
+                  <button type="button" class="danger" onclick={() => removeHostPolicy(p)}>Delete</button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+    </div>
+
+    <div class="panel" style="margin-top: 1.25rem">
       <h2 class="section-title">Revoke sessions</h2>
       <p class="muted" style="margin-top: 0">
         Immediately invalidate all sessions for a Discord user (kick / compromise response).
@@ -311,7 +440,7 @@
         <div>
           <h2 class="section-title">Audit history</h2>
           <p class="muted" style="margin: 0">
-            Mapping changes and session revokes. Newest first.
+            Mapping, host policy, and session revoke events. Newest first.
           </p>
         </div>
         <span class="muted">{auditRangeLabel()}</span>

@@ -14,6 +14,7 @@ import (
 	"github.com/yitech/discord-forward-auth/internal/audit"
 	"github.com/yitech/discord-forward-auth/internal/config"
 	"github.com/yitech/discord-forward-auth/internal/discord"
+	"github.com/yitech/discord-forward-auth/internal/hostpolicy"
 	"github.com/yitech/discord-forward-auth/internal/httpapi"
 	"github.com/yitech/discord-forward-auth/internal/mapping"
 	"github.com/yitech/discord-forward-auth/internal/session"
@@ -77,12 +78,20 @@ func testCfg() *config.Config {
 
 func newTestServer(t *testing.T, d *discordMock, maps mapping.Store) (*httpapi.Server, *session.MemoryStore, *audit.MemoryStore) {
 	t.Helper()
+	return newTestServerWithHosts(t, d, maps, nil)
+}
+
+func newTestServerWithHosts(t *testing.T, d *discordMock, maps mapping.Store, hosts hostpolicy.Store) (*httpapi.Server, *session.MemoryStore, *audit.MemoryStore) {
+	t.Helper()
 	if maps == nil {
 		maps = mapping.NewMemoryStore()
 	}
+	if hosts == nil {
+		hosts = hostpolicy.NewMemoryStore()
+	}
 	sess := session.NewMemoryStore()
 	aud := audit.NewMemoryStore()
-	srv := httpapi.New(testCfg(), sess, maps, aud, d, nil, nil)
+	srv := httpapi.New(testCfg(), sess, maps, hosts, aud, d, nil, nil)
 	return srv, sess, aud
 }
 
@@ -221,6 +230,128 @@ func TestForwardAuthValidSession(t *testing.T) {
 	}
 	if rr.Header().Get("X-Auth-Groups") != "viewer" {
 		t.Fatalf("groups=%s", rr.Header().Get("X-Auth-Groups"))
+	}
+}
+
+func TestForwardAuthHostPolicy(t *testing.T) {
+	hosts := hostpolicy.NewMemoryStore()
+	_ = hosts.Upsert(context.Background(), "grafana.example.com", []string{"engineer"}, "seed")
+	srv, store, _ := newTestServerWithHosts(t, &discordMock{}, nil, hosts)
+
+	engineer, err := store.Create(context.Background(), "e1", []string{"engineer"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bd, err := store.Create(context.Background(), "b1", []string{"bd"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := store.Create(context.Background(), "a1", []string{"admin"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("matching group", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Forwarded-Host", "grafana.example.com")
+		req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: engineer.ID})
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("wrong group", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Forwarded-Host", "grafana.example.com")
+		req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: bd.ID})
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("status=%d", rr.Code)
+		}
+	})
+
+	t.Run("unknown host fail closed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Forwarded-Host", "metabase.example.com")
+		req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: engineer.ID})
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("status=%d", rr.Code)
+		}
+	})
+
+	t.Run("admin bypass", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Forwarded-Host", "metabase.example.com")
+		req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
+func TestAdminHostPolicies(t *testing.T) {
+	hosts := hostpolicy.NewMemoryStore()
+	srv, store, aud := newTestServerWithHosts(t, &discordMock{}, nil, hosts)
+	admin, _ := store.Create(context.Background(), "a1", []string{"admin"}, time.Hour)
+	viewer, _ := store.Create(context.Background(), "v1", []string{"viewer"}, time.Hour)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/host-policies", nil)
+	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: viewer.ID})
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("viewer status=%d", rr.Code)
+	}
+
+	body := `{"host":"Grafana.Example.Com","required_groups":["engineer"," bd "]}`
+	req = withOrigin(httptest.NewRequest(http.MethodPost, "/api/host-policies", strings.NewReader(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upsert status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/host-policies", nil)
+	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list status=%d", rr.Code)
+	}
+	var list []hostpolicy.Policy
+	if err := json.NewDecoder(rr.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Host != "grafana.example.com" || len(list[0].RequiredGroups) != 2 {
+		t.Fatalf("list=%v", list)
+	}
+
+	req = withOrigin(httptest.NewRequest(http.MethodDelete, "/api/host-policies?host=grafana.example.com", nil))
+	req.AddCookie(&http.Cookie{Name: "discord_auth_session", Value: admin.ID})
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete status=%d", rr.Code)
+	}
+
+	events, total, err := aud.List(context.Background(), 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 {
+		t.Fatalf("audit total=%d", total)
+	}
+	if events[0].Action != audit.ActionHostPolicyDelete || events[1].Action != audit.ActionHostPolicyUpsert {
+		t.Fatalf("actions=%s,%s", events[0].Action, events[1].Action)
 	}
 }
 

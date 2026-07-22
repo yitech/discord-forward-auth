@@ -36,12 +36,21 @@ http:
       # Protect /admin via the service's own session checks + /api/* admin gate.
       tls: {}
 
-    # Example protected app
-    my-app:
-      rule: "Host(`app.example.com`)"
+    # Example protected apps (same middleware; host ACL is configured in admin UI).
+    # e.g. grafana.example.com → required group "engineer"
+    #      metabase.example.com → required group "bd"
+    grafana:
+      rule: "Host(`grafana.example.com`)"
       entryPoints: ["websecure"]
       middlewares: ["discord-auth-chain"]
-      service: my-app
+      service: grafana
+      tls: {}
+
+    metabase:
+      rule: "Host(`metabase.example.com`)"
+      entryPoints: ["websecure"]
+      middlewares: ["discord-auth-chain"]
+      service: metabase
       tls: {}
 
   services:
@@ -49,7 +58,11 @@ http:
       loadBalancer:
         servers:
           - url: "http://discord-auth:4181"
-    my-app:
+    grafana:
       loadBalancer:
         servers:
-          - url: "http://my-app:8080"
+          - url: "http://grafana:3000"
+    metabase:
+      loadBalancer:
+        servers:
+          - url: "http://metabase:3000"
