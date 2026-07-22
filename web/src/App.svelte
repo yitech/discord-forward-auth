@@ -6,6 +6,9 @@
   let roleId = $state('')
   let groupName = $state('')
   let saving = $state(false)
+  let revokeUser = $state('')
+  let revoking = $state(false)
+  let notice = $state('')
 
   async function load() {
     loading = true
@@ -41,6 +44,7 @@
     e.preventDefault()
     saving = true
     error = ''
+    notice = ''
     try {
       const res = await fetch('/api/mappings', {
         method: 'POST',
@@ -64,6 +68,7 @@
   async function removeMapping(m) {
     if (!confirm(`Delete ${m.group_name} ← ${m.role_id}?`)) return
     error = ''
+    notice = ''
     try {
       const qs = new URLSearchParams({
         role_id: m.role_id,
@@ -79,6 +84,33 @@
       await load()
     } catch (e) {
       error = e.message || 'Failed to delete'
+    }
+  }
+
+  async function revokeSessions(e) {
+    e.preventDefault()
+    const target = revokeUser.trim()
+    if (!target) return
+    if (!confirm(`Revoke all sessions for Discord user ${target}?`)) return
+    revoking = true
+    error = ''
+    notice = ''
+    try {
+      const res = await fetch('/api/sessions/revoke', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ discord_user: target }),
+      })
+      if (!res.ok) {
+        throw new Error(await res.text())
+      }
+      notice = `Revoked sessions for ${target}`
+      revokeUser = ''
+    } catch (e) {
+      error = e.message || 'Failed to revoke'
+    } finally {
+      revoking = false
     }
   }
 
@@ -147,6 +179,9 @@
       {#if error}
         <p class="error">{error}</p>
       {/if}
+      {#if notice}
+        <p class="notice">{notice}</p>
+      {/if}
 
       {#if mappings.length === 0}
         <p class="empty">No mappings yet. Bootstrap admins use BOOTSTRAP_ADMIN_ROLE_ID until you add rows here.</p>
@@ -176,6 +211,25 @@
           </tbody>
         </table>
       {/if}
+    </div>
+
+    <div class="panel" style="margin-top: 1.25rem">
+      <h2 class="section-title">Revoke sessions</h2>
+      <p class="muted" style="margin-top: 0">
+        Immediately invalidate all sessions for a Discord user (kick / compromise response).
+      </p>
+      <form class="form-row" onsubmit={revokeSessions}>
+        <input
+          bind:value={revokeUser}
+          placeholder="Discord user snowflake"
+          required
+          class="mono"
+          autocomplete="off"
+        />
+        <button type="submit" class="danger" disabled={revoking}>
+          {revoking ? 'Revoking…' : 'Revoke sessions'}
+        </button>
+      </form>
     </div>
   {/if}
 </main>

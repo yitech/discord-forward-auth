@@ -23,3 +23,20 @@ func TestSafeReturnPath(t *testing.T) {
 		}
 	}
 }
+
+func TestReturnURL(t *testing.T) {
+	cases := []struct {
+		path, host, auth, want string
+	}{
+		{"/admin/", "", "auth.example.com", "/admin/"},
+		{"/admin/", "auth.example.com", "auth.example.com", "/admin/"},
+		{"/secret", "app.example.com", "auth.example.com", "https://app.example.com/secret"},
+		{"https://evil.com", "app.example.com", "auth.example.com", "https://app.example.com/"},
+	}
+	for _, tc := range cases {
+		got := ReturnURL(tc.path, tc.host, tc.auth)
+		if got != tc.want {
+			t.Fatalf("ReturnURL(%q,%q,%q)=%q want %q", tc.path, tc.host, tc.auth, got, tc.want)
+		}
+	}
+}

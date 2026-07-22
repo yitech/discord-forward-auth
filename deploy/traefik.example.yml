@@ -1,5 +1,8 @@
 # Example Traefik dynamic config for discord-forward-auth.
 # Register Discord OAuth redirect URI: https://auth.example.com/_oauth
+#
+# REQUIRED: set COOKIE_DOMAIN=.example.com on discord-auth so CSRF + session
+# cookies are shared between auth.example.com and app.example.com.
 
 http:
   middlewares:
