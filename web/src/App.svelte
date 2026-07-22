@@ -1,5 +1,8 @@
 <script>
   const AUDIT_PAGE_SIZE = 25
+  const isAdminRoute =
+    typeof window !== 'undefined' &&
+    (window.location.pathname === '/admin' || window.location.pathname.startsWith('/admin/'))
 
   let me = $state(null)
   let mappings = $state([])
@@ -36,7 +39,7 @@
         throw new Error('Failed to load session')
       }
       me = await meRes.json()
-      if (!me.admin) {
+      if (!isAdminRoute || !me.admin) {
         loading = false
         return
       }
@@ -206,13 +209,13 @@
     }
   }
 
-  function signIn() {
-    window.location.href = '/?rd=/admin/'
+  function signIn(returnPath = '/') {
+    window.location.href = `/?rd=${encodeURIComponent(returnPath)}`
   }
 
   async function signOut() {
     await fetch('/_oauth/logout', { credentials: 'same-origin' })
-    window.location.href = '/admin/'
+    window.location.href = '/'
   }
 
   function formatAction(action) {
@@ -283,6 +286,11 @@
     return auditOffset + AUDIT_PAGE_SIZE < auditTotal
   }
 
+  function groupsLabel() {
+    if (!me?.groups?.length) return 'none'
+    return me.groups.join(', ')
+  }
+
   $effect(() => {
     load()
   })
@@ -291,11 +299,46 @@
 <main class="shell">
   {#if loading}
     <div class="center muted">Loading…</div>
+  {:else if !isAdminRoute}
+    {#if !me}
+      <div class="center panel home-panel">
+        <h1>Discord Forward Auth</h1>
+        <p class="lede">Welcome, guest.</p>
+        <p class="muted">Sign in with Discord to access protected apps on this domain.</p>
+        <div class="actions">
+          <button type="button" onclick={() => signIn('/')}>Sign in with Discord</button>
+        </div>
+      </div>
+    {:else}
+      <div class="center panel home-panel">
+        <h1>Discord Forward Auth</h1>
+        <p class="lede">You are signed in.</p>
+        <dl class="identity">
+          <div>
+            <dt>Discord user</dt>
+            <dd class="mono">{me.discord_user}</dd>
+          </div>
+          <div>
+            <dt>Groups</dt>
+            <dd class="mono">{groupsLabel()}</dd>
+          </div>
+        </dl>
+        <div class="actions">
+          {#if me.admin}
+            <a class="button" href="/admin/">Admin</a>
+          {/if}
+          <button type="button" class="secondary" onclick={signOut}>Sign out</button>
+        </div>
+      </div>
+    {/if}
   {:else if !me}
     <div class="center panel">
-      <h1>Discord Forward Auth</h1>
+      <h1>Admin</h1>
       <p class="muted">Sign in with Discord to manage role → group mappings and host policies.</p>
-      <button type="button" onclick={signIn}>Sign in with Discord</button>
+      <div class="actions">
+        <button type="button" onclick={() => signIn('/admin/')}>Sign in with Discord</button>
+        <a class="button secondary" href="/">Home</a>
+      </div>
     </div>
   {:else if !me.admin}
     <div class="center panel">
@@ -304,7 +347,10 @@
         Signed in as <span class="mono">{me.discord_user}</span>, but you are not in the
         <span class="mono">{me.admin_group}</span> group.
       </p>
-      <button type="button" class="secondary" onclick={signOut}>Sign out</button>
+      <div class="actions">
+        <a class="button secondary" href="/">Home</a>
+        <button type="button" class="secondary" onclick={signOut}>Sign out</button>
+      </div>
     </div>
   {:else}
     <div class="header">
@@ -315,7 +361,10 @@
           · admin <span class="mono">{me.discord_user}</span>
         </p>
       </div>
-      <button type="button" class="secondary" onclick={signOut}>Sign out</button>
+      <div class="actions">
+        <a class="button secondary" href="/">Home</a>
+        <button type="button" class="secondary" onclick={signOut}>Sign out</button>
+      </div>
     </div>
 
     {#if error}

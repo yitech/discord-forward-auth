@@ -3,9 +3,10 @@ import { svelte } from '@sveltejs/vite-plugin-svelte'
 
 export default defineConfig({
   plugins: [svelte()],
-  base: '/admin/',
+  base: '/',
+  appType: 'spa',
   build: {
-    outDir: '../cmd/discord-auth/admin',
+    outDir: '../cmd/discord-auth/web',
     emptyOutDir: true,
   },
   server: {

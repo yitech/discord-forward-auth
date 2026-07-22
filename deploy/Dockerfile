@@ -13,7 +13,7 @@ RUN apk add --no-cache git ca-certificates
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-COPY --from=web /src/cmd/discord-auth/admin ./cmd/discord-auth/admin
+COPY --from=web /src/cmd/discord-auth/web ./cmd/discord-auth/web
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/discord-auth ./cmd/discord-auth
 
 FROM alpine:3.21

@@ -35,7 +35,7 @@ type Server struct {
 	audit    audit.Store
 	discord  discord.API
 	authz    *authz.Resolver
-	adminFS  fs.FS
+	webFS    fs.FS
 	log      *slog.Logger
 	now      func() time.Time
 }
@@ -47,7 +47,7 @@ func New(
 	hosts hostpolicy.Store,
 	auditStore audit.Store,
 	discordAPI discord.API,
-	adminFS fs.FS,
+	webFS fs.FS,
 	log *slog.Logger,
 ) *Server {
 	if log == nil {
@@ -69,9 +69,9 @@ func New(
 			BootstrapAdminRole: cfg.BootstrapAdminRole,
 			AdminGroup:         cfg.AdminGroup,
 		},
-		adminFS: adminFS,
-		log:     log,
-		now:     time.Now,
+		webFS: webFS,
+		log:   log,
+		now:   time.Now,
 	}
 }
 
@@ -89,24 +89,50 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/revoke", s.requireAdmin(s.requireSameOrigin(s.handleRevokeSessions)))
 	mux.HandleFunc("GET /api/audit", s.requireAdmin(s.handleListAudit))
 
-	if s.adminFS != nil {
+	if s.webFS != nil {
+		mux.Handle("GET /assets/", http.FileServer(http.FS(s.webFS)))
+		mux.HandleFunc("GET /favicon.svg", func(w http.ResponseWriter, r *http.Request) {
+			http.ServeFileFS(w, r, s.webFS, "favicon.svg")
+		})
 		mux.Handle("GET /admin/", s.adminHandler())
 		mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/admin/", http.StatusFound)
 		})
 	}
 
-	mux.HandleFunc("/", s.handleForwardAuth)
+	mux.HandleFunc("/", s.handleRoot)
 	return mux
 }
 
-func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
+// handleRoot serves the public index for direct AUTH_HOST browses, and
+// ForwardAuth for Traefik probes, explicit login (?rd=), and other paths.
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 		return
 	}
 
+	if isForwardAuthRequest(r) || r.URL.Query().Get("rd") != "" || r.URL.Path != "/" {
+		s.handleForwardAuth(w, r)
+		return
+	}
+
+	// Direct browser visit to AUTH_HOST / — guest/home page (not OAuth).
+	if s.webFS != nil && isLoginNavigation(r) {
+		http.ServeFileFS(w, r, s.webFS, "index.html")
+		return
+	}
+
+	s.handleForwardAuth(w, r)
+}
+
+func isForwardAuthRequest(r *http.Request) bool {
+	// Traefik ForwardAuth always sets X-Forwarded-Uri to the protected request path.
+	return r.Header.Get("X-Forwarded-Uri") != ""
+}
+
+func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
 	id := s.sessionIDFromRequest(r)
 	if id == "" {
 		s.unauthenticated(w, r)
@@ -211,7 +237,7 @@ func (s *Server) redirectToLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func originalReturn(r *http.Request, cfg *config.Config) (path, host string) {
-	// Explicit return target (admin UI login).
+	// Explicit return target (home or admin login).
 	if rd := r.URL.Query().Get("rd"); rd != "" {
 		return SafeReturnPath(rd), ""
 	}
@@ -221,9 +247,8 @@ func originalReturn(r *http.Request, cfg *config.Config) (path, host string) {
 	} else if r.URL.Path != "" && r.URL.Path != "/" {
 		path = SafeReturnPath(r.URL.RequestURI())
 	} else {
-		// Direct browse to AUTH_HOST root. "/" is the bodyless ForwardAuth
-		// endpoint; send humans to the admin UI after login instead.
-		path = "/admin/"
+		// Direct AUTH_HOST login without ?rd= — return to the public index.
+		path = "/"
 	}
 
 	host = config.NormalizeHost(r.Header.Get("X-Forwarded-Host"))
@@ -692,18 +717,10 @@ func parsePagination(r *http.Request, defaultLimit, maxLimit int) (limit, offset
 }
 
 func (s *Server) adminHandler() http.Handler {
-	fileServer := http.FileServer(http.FS(s.adminFS))
-	return http.StripPrefix("/admin/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/")
-		if path == "" {
-			path = "index.html"
-		}
-		if _, err := fs.Stat(s.adminFS, path); err != nil {
-			http.ServeFileFS(w, r, s.adminFS, "index.html")
-			return
-		}
-		fileServer.ServeHTTP(w, r)
-	}))
+	// Admin UI shares the same SPA shell as the public index (client routes on path).
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFileFS(w, r, s.webFS, "index.html")
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

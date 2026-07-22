@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/yitech/discord-forward-auth/internal/audit"
@@ -83,6 +85,17 @@ func newTestServer(t *testing.T, d *discordMock, maps mapping.Store) (*httpapi.S
 
 func newTestServerWithHosts(t *testing.T, d *discordMock, maps mapping.Store, hosts hostpolicy.Store) (*httpapi.Server, *session.MemoryStore, *audit.MemoryStore) {
 	t.Helper()
+	return newTestServerWithWeb(t, d, maps, hosts, nil)
+}
+
+func newTestServerWithWeb(
+	t *testing.T,
+	d *discordMock,
+	maps mapping.Store,
+	hosts hostpolicy.Store,
+	webFS fs.FS,
+) (*httpapi.Server, *session.MemoryStore, *audit.MemoryStore) {
+	t.Helper()
 	if maps == nil {
 		maps = mapping.NewMemoryStore()
 	}
@@ -91,7 +104,7 @@ func newTestServerWithHosts(t *testing.T, d *discordMock, maps mapping.Store, ho
 	}
 	sess := session.NewMemoryStore()
 	aud := audit.NewMemoryStore()
-	srv := httpapi.New(testCfg(), sess, maps, hosts, aud, d, nil, nil)
+	srv := httpapi.New(testCfg(), sess, maps, hosts, aud, d, webFS, nil)
 	return srv, sess, aud
 }
 
@@ -191,6 +204,7 @@ func TestForwardAuthSubresourceDoesNotMintCSRF(t *testing.T) {
 }
 
 func TestForwardAuthAcceptHTMLWithoutFetchMetadata(t *testing.T) {
+	// Without embedded UI, HTML Accept on / still starts OAuth (ForwardAuth fallback).
 	srv, _, _ := newTestServer(t, &discordMock{}, nil)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
@@ -198,6 +212,44 @@ func TestForwardAuthAcceptHTMLWithoutFetchMetadata(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusFound {
 		t.Fatalf("status=%d", rr.Code)
+	}
+}
+
+func TestPublicIndexServesGuestPage(t *testing.T) {
+	web := fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("<html>home</html>")},
+	}
+	srv, _, _ := newTestServerWithWeb(t, &discordMock{}, nil, nil, web)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "home") {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
+func TestPublicIndexLoginQueryStartsOAuth(t *testing.T) {
+	web := fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("<html>home</html>")},
+	}
+	srv, _, _ := newTestServerWithWeb(t, &discordMock{}, nil, nil, web)
+
+	req := httptest.NewRequest(http.MethodGet, "/?rd=/", nil)
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	if !strings.Contains(rr.Header().Get("Location"), "discord.com/api/oauth2/authorize") {
+		t.Fatalf("location=%s", rr.Header().Get("Location"))
 	}
 }
 
@@ -524,14 +576,13 @@ func TestOAuthCallbackSuccess(t *testing.T) {
 	}
 }
 
-// Direct browse to AUTH_HOST / has no X-Forwarded-Uri; post-login must not
-// land on the bodyless ForwardAuth endpoint (issue #5).
-func TestOAuthCallbackDirectAuthHostRootReturnsAdmin(t *testing.T) {
+// Direct AUTH_HOST login without an app return target lands on the public index.
+func TestOAuthCallbackDirectAuthHostRootReturnsHome(t *testing.T) {
 	maps := mapping.NewMemoryStore()
 	_ = maps.Upsert(context.Background(), "guild1", "role-viewer", "viewer", "seed")
 	d := &discordMock{member: &discord.Member{Roles: []string{"role-viewer"}}}
 	srv, _, _ := newTestServer(t, d, maps)
-	state := csrfFromLogin(t, srv, "/", map[string]string{
+	state := csrfFromLogin(t, srv, "/?rd=/", map[string]string{
 		"Sec-Fetch-Mode": "navigate",
 		"Sec-Fetch-Dest": "document",
 	})
@@ -543,7 +594,7 @@ func TestOAuthCallbackDirectAuthHostRootReturnsAdmin(t *testing.T) {
 	if rr.Code != http.StatusFound {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if rr.Header().Get("Location") != "/admin/" {
+	if rr.Header().Get("Location") != "/" {
 		t.Fatalf("location=%s", rr.Header().Get("Location"))
 	}
 }
@@ -573,7 +624,7 @@ func TestOAuthCallbackRedirectsToAppHost(t *testing.T) {
 func TestOAuthCallbackBootstrapAdmin(t *testing.T) {
 	d := &discordMock{member: &discord.Member{Roles: []string{"boot-role"}}}
 	srv, _, _ := newTestServer(t, d, mapping.NewMemoryStore())
-	state := csrfFromLogin(t, srv, "/", nil)
+	state := csrfFromLogin(t, srv, "/?rd=/", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/_oauth?code=abc&state="+state, nil)
 	req.AddCookie(&http.Cookie{Name: "discord_auth_csrf", Value: state})
@@ -582,7 +633,7 @@ func TestOAuthCallbackBootstrapAdmin(t *testing.T) {
 	if rr.Code != http.StatusFound {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if rr.Header().Get("Location") != "/admin/" {
+	if rr.Header().Get("Location") != "/" {
 		t.Fatalf("location=%s", rr.Header().Get("Location"))
 	}
 }
