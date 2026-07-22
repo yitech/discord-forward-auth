@@ -220,6 +220,10 @@ tr.dim {
 .home-panel {
   max-width: 28rem;
   width: 100%;
+  display: grid;
+  gap: 1rem;
+  text-align: center;
+  justify-items: center;
 }
 
 .lede {
