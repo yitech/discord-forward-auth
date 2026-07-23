@@ -16,6 +16,10 @@
 web/node_modules/
 web/dist/
 
+# Embedded UI build output (cd web && npm run build)
+/cmd/discord-auth/web/**
+!/cmd/discord-auth/web/.gitkeep
+
 # OS / IDE
 .DS_Store
 .idea/

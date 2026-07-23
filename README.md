@@ -194,7 +194,7 @@ go run ./cmd/discord-auth
 cd web && npm install && npm run dev
 ```
 
-Production UI is embedded: `cd web && npm run build` writes into `cmd/discord-auth/web/`.
+Production UI is embedded at build time: `cd web && npm run build` writes into `cmd/discord-auth/web/` (gitignored). The Docker image runs that step; for a local Go binary with the UI, build the web package first.
 
 ## Auth flow (summary)
 
